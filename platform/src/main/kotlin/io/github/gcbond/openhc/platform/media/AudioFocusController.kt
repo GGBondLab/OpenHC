@@ -52,7 +52,8 @@ class AudioFocusController(context: Context, private val listener: Listener) : C
     /** 手机要这个用途的焦点；[gain] 是它要的类型（null 按用途的默认）。 */
     fun phoneRequested(usage: AudioUsage, gain: AudioFocusPolicy.Gain? = null) = post { policy.phoneRequested(usage, now(), gain) }
 
-    fun phoneAbandoned(usage: AudioUsage) = post { policy.phoneAbandoned(usage, now()) }
+    fun phoneAbandoned(usage: AudioUsage, transientOnly: Boolean = false) =
+        post { policy.phoneAbandoned(usage, now(), transientOnly) }
 
     fun phoneAbandonedAll() = post { policy.phoneAbandonedAll(now()) }
 

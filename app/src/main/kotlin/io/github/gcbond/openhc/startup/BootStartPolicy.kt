@@ -15,6 +15,9 @@ object BootStartPolicy {
      * 熄火后再点火走同一个入口。
      */
     const val ACTION_BOOT_COMPLETED = "android.intent.action.BOOT_COMPLETED"
+    const val ACTION_QUICKBOOT_POWERON = "android.intent.action.QUICKBOOT_POWERON"
+    const val ACTION_HTC_QUICKBOOT_POWERON = "com.htc.intent.action.QUICKBOOT_POWERON"
+    private val BOOT_ACTIONS = setOf(ACTION_BOOT_COMPLETED, ACTION_QUICKBOOT_POWERON, ACTION_HTC_QUICKBOOT_POWERON)
 
     /** 收到开机广播后打开界面用的动作，界面据此开始有线连接（等插线）。 */
     const val ACTION_BOOT_LAUNCH = "io.github.gcbond.openhc.action.BOOT_LAUNCH"
@@ -31,13 +34,20 @@ object BootStartPolicy {
     /** 收到开机广播时系统已经运行超过这么久，多半是熄火后再点火、系统重发的。 */
     const val FRESH_BOOT_LIMIT_MS = 5 * 60_000L
 
+    /** 同一台车机短时间内同时发 QUICKBOOT_POWERON 和 BOOT_COMPLETED 时去重窗口。 */
+    const val BOOT_DEDUPE_WINDOW_MS = 15_000L
+
     /**
-     * 打开界面后过这么久看它在不在前台：不在（没出来，或者出来后被车机自己的桌面等界面盖住）就再开一次，
-     * 再过这么久记下结果。
+     * 打开界面后过这么久看它在不在前台：不在（没出来，或者出来后被车机自己的桌面等界面盖住）就再拉到前台，
+     * 最多补开 [MAX_COVERED_RETRIES] 次（覆盖开机初期车机桌面抢焦窗口）。
      */
     const val CHECK_DELAY_MS = 4_000L
+    const val MAX_COVERED_RETRIES = 3
 
-    fun isBootBroadcast(action: String?): Boolean = action == ACTION_BOOT_COMPLETED
+    fun isBootBroadcast(action: String?): Boolean = action in BOOT_ACTIONS
+
+    fun isDuplicateBoot(lastElapsedMs: Long, nowElapsedMs: Long): Boolean =
+        lastElapsedMs >= 0L && nowElapsedMs >= lastElapsedMs && nowElapsedMs - lastElapsedMs < BOOT_DEDUPE_WINDOW_MS
 
     /**
      * 界面收到的是开机打开。[fromHistory]：车主从「最近任务」重开时，系统会把最初打开这个任务的 Intent 再给一遍，
@@ -67,6 +77,9 @@ object BootStartPolicy {
 
     /** 检查时界面不在前台就再开一次，只补一次。 */
     fun shouldRetry(inFront: Boolean, retried: Boolean): Boolean = !inFront && !retried
+
+    /** 检查时界面不在前台，且未超过补开次数上限时继续补开。 */
+    fun shouldRetryAttempt(inFront: Boolean, retries: Int): Boolean = !inFront && retries < MAX_COVERED_RETRIES
 
     /** 检查完的结论。[inFront]：此刻界面在前台；[everShown]：界面到过前台。 */
     fun outcome(inFront: Boolean, everShown: Boolean, sdkInt: Int, overlayGranted: Boolean): BootOutcome = when {

@@ -11,19 +11,43 @@ import io.github.gcbond.openhc.platform.media.DisplayRefreshRate
 /** 从系统读车机的蓝牙地址属性和屏幕参数。 */
 internal object DeviceInfo {
 
+    private val systemPropertiesGet: java.lang.reflect.Method? by lazy { findSystemPropertiesGet() }
+
+    @SuppressLint("PrivateApi")
+    private fun findSystemPropertiesGet(): java.lang.reflect.Method? = try {
+        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
+    } catch (_: ReflectiveOperationException) {
+        null
+    } catch (_: RuntimeException) {
+        null
+    }
+
+    @Volatile
+    private var cachedBluetoothAddress: String? = null
+
     /**
      * 按顺序读系统属性 [BluetoothAddressPolicy.SYSTEM_PROPERTY_KEYS]，取第一个有效的地址，都读不到返回 null。
      * 系统属性的读取接口没有公开，只能反射。安卓 9 起非公开接口受限，这个接口属于允许调用、系统只记一行警告的那一类；
      * 将来的系统要是拦了，这里返回 null，退回手填地址。
      */
-    @SuppressLint("PrivateApi")
-    fun systemBluetoothAddress(): String? = try {
-        val get = Class.forName("android.os.SystemProperties").getMethod("get", String::class.java)
-        BluetoothAddressPolicy.firstValid(BluetoothAddressPolicy.SYSTEM_PROPERTY_KEYS.map { get.invoke(null, it) as? String })
-    } catch (e: ReflectiveOperationException) {
-        null
-    } catch (e: RuntimeException) {
-        null
+    fun systemBluetoothAddress(): String? {
+        cachedBluetoothAddress?.let { return it }
+        val get = systemPropertiesGet ?: return null
+        return try {
+            for (key in BluetoothAddressPolicy.SYSTEM_PROPERTY_KEYS) {
+                val raw = get.invoke(null, key) as? String ?: continue
+                val valid = BluetoothAddressPolicy.normalize(raw)
+                if (valid != null) {
+                    cachedBluetoothAddress = valid
+                    return valid
+                }
+            }
+            null
+        } catch (_: ReflectiveOperationException) {
+            null
+        } catch (_: RuntimeException) {
+            null
+        }
     }
 
     /** 默认屏幕（车机主屏）的实际像素、DPI 和按刷新率算出的帧率。 */

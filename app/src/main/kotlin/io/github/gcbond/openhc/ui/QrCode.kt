@@ -1,23 +1,23 @@
 package io.github.gcbond.openhc.ui
 
-import android.graphics.Bitmap
-import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.FilterQuality
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.EncodeHintType
 import com.google.zxing.common.BitMatrix
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import io.github.gcbond.openhc.R
+import kotlin.math.floor
 
 /** 二维码编码（ZXing，Apache-2.0）。纯逻辑，由 JVM 单元测试覆盖。 */
 internal object QrCodes {
@@ -37,29 +37,41 @@ internal object QrCodes {
 }
 
 /**
- * 显示二维码：白底黑块，不随深色模式反色（反色了很多手机扫不出来）；放大时不做平滑，边缘保持清楚。
+ * 显示二维码：白底黑块，不随深色模式反色（反色了很多手机扫不出来）。
+ * 直接在画布上按每模块整数像素居中绘制，零位图分配且消除非整数倍缩放产生的宽窄交替模糊。
  */
 @Composable
 internal fun QrCodeImage(content: String, modifier: Modifier = Modifier) {
-    val bitmap = remember(content) { QrCodes.encode(content).toImageBitmap() }
-    Image(
-        bitmap = bitmap,
-        contentDescription = stringResource(R.string.wireless_qr_description),
-        modifier = modifier.background(Color.White),
-        contentScale = ContentScale.Fit,
-        filterQuality = FilterQuality.None,
-    )
+    val matrix = remember(content) { QrCodes.encode(content) }
+    val desc = stringResource(R.string.wireless_qr_description)
+    Canvas(
+        modifier = modifier
+            .background(Color.White)
+            .semantics { contentDescription = desc },
+    ) {
+        val cols = matrix.width
+        val rows = matrix.height
+        if (cols <= 0 || rows <= 0) return@Canvas
+        val rawCell = minOf(size.width / cols, size.height / rows)
+        val cell = if (rawCell >= 2f) floor(rawCell) else rawCell
+        val left = floor((size.width - cell * cols) / 2f)
+        val top = floor((size.height - cell * rows) / 2f)
+        for (y in 0 until rows) {
+            var x = 0
+            while (x < cols) {
+                if (matrix.get(x, y)) {
+                    var run = 1
+                    while (x + run < cols && matrix.get(x + run, y)) run++
+                    drawRect(
+                        color = Color.Black,
+                        topLeft = Offset(left + x * cell, top + y * cell),
+                        size = Size(cell * run, cell),
+                    )
+                    x += run
+                } else {
+                    x++
+                }
+            }
+        }
+    }
 }
-
-private fun BitMatrix.toImageBitmap(): ImageBitmap {
-    val w = width
-    val h = height
-    val pixels = IntArray(w * h) { i -> if (get(i % w, i / w)) BLACK else WHITE }
-    return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
-}
-
-/** 不透明黑（ARGB 0xFF000000）。 */
-private const val BLACK = -0x1000000
-
-/** 不透明白（ARGB 0xFFFFFFFF）。 */
-private const val WHITE = -1

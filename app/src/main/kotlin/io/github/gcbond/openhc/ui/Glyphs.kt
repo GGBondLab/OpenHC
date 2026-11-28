@@ -46,6 +46,14 @@ internal object Glyphs {
         )
     }
     val Document by lazy { stroke("document", "M14 2H6v20h12V6z M14 2v4h4 M8 13h8 M8 17h5") }
+    /** 车机投屏互联图形徽标：无线电波 + 屏幕框架。 */
+    val CarLink by lazy {
+        stroke(
+            "car_link",
+            "M3 7a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-4 M3 17a2 2 0 0 1 2 2 M3 13a6 6 0 0 1 6 6 M3 9a10 10 0 0 1 10 10",
+        )
+    }
+    val Check by lazy { stroke("check", "M5 13l4 4L19 7") }
 
     private fun stroke(name: String, path: String): ImageVector =
         ImageVector.Builder(name, 24.dp, 24.dp, 24f, 24f)

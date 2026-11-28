@@ -28,6 +28,4 @@
     <string name="settings_audio_delay_summary">声音比画面早时往上调</string>
     <string name="settings_audio_navigation_stream_summary">导航和音乐音量连在一起时改</string>
     <string name="settings_audio_media_stream_summary">一般留「自动」</string>
-
-    <string name="settings_diag_export_summary">遇到问题时导出，反馈时附上</string>
 </resources>

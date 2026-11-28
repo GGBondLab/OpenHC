@@ -1,8 +1,8 @@
 package io.github.gcbond.openhc.wifi
 
 import android.content.Context
-import android.util.Log
 import androidx.core.content.edit
+import io.github.gcbond.openhc.platform.log.Log
 
 /** 「自动打开车机热点」的开关和待关闭记号（单独一个 SharedPreferences 文件）。 */
 class CarHotspotAutoPreferences(context: Context) : PendingJournal {

@@ -1,23 +1,8 @@
 package io.github.gcbond.openhc.ui
 
 import android.content.Context
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.em
-import androidx.compose.ui.window.Dialog
 import io.github.gcbond.openhc.R
 import io.github.gcbond.openhc.settings.AppSettings
 import io.github.gcbond.openhc.settings.AudioPreferences
@@ -78,29 +63,20 @@ private fun PendingSetting.label(): Int = when (this) {
 @Composable
 internal fun ReconnectReminderDialog(changed: List<PendingSetting>, projecting: Boolean, onDismiss: () -> Unit) {
     val names = changed.map { stringResource(it.label()) }.joinToString("、")
-    Dialog(onDismissRequest = onDismiss) {
-        val compact = LocalCompact.current
-        Column(
-            Modifier
-                .widthIn(max = 640.dp)
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(Dimens.CardRadius))
-                .background(Palette.Raised)
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Text(stringResource(R.string.reconnect_reminder_title), style = UiType.status, color = Palette.Text)
-            Text(
-                stringResource(if (projecting) R.string.reconnect_reminder_projecting else R.string.reconnect_reminder_waiting, names),
-                style = UiType.rowTitle(compact).copy(lineHeight = 1.5.em, fontWeight = FontWeight.Normal),
-                color = Palette.Text,
-            )
+    DialogCard(
+        title = stringResource(R.string.reconnect_reminder_title),
+        onDismiss = onDismiss,
+        dismissOnClickOutside = true,
+        buttons = {
             ActionButton(
                 stringResource(R.string.reconnect_reminder_ok),
                 onClick = onDismiss,
                 kind = ActionKind.PRIMARY,
-                modifier = Modifier.align(Alignment.End),
             )
-        }
+        },
+    ) {
+        DialogText(
+            stringResource(if (projecting) R.string.reconnect_reminder_projecting else R.string.reconnect_reminder_waiting, names),
+        )
     }
 }

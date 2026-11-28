@@ -276,6 +276,8 @@ class VideoDecoder @JvmOverloads constructor(
     private var choreographerUnavailable = false
     private var vsyncRequested = false
     private var gridLogged = false
+    private var holdTimeoutScheduled = false
+    private var scheduledReleaseAtNs = FramePacer.NONE
 
     /** 最近一次有帧要上屏的时刻（System.nanoTime）：空闲久了就不再要刷新回调。 */
     private var lastShowNs = 0L
@@ -293,7 +295,7 @@ class VideoDecoder @JvmOverloads constructor(
     var lastStats: VideoStats? = null
         private set
 
-    private val thread = HandlerThread("OpenHC-VideoDecoder").also { it.start() }
+    private val thread = HandlerThread("OpenHC-VideoDecoder", android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY).also { it.start() }
     private val handler = Handler(thread.looper)
     private val codecCallback = CodecCallback()
     private val renderListener = MediaCodec.OnFrameRenderedListener { c, _, _ ->
@@ -301,7 +303,10 @@ class VideoDecoder @JvmOverloads constructor(
     }
     private val holdTimeout = Runnable { onReplayHoldTimeout() }
     private val vsyncCallback = Choreographer.FrameCallback { frameTimeNanos -> onVsync(frameTimeNanos) }
-    private val heldDue = Runnable { onHeldDue() }
+    private val heldDue = Runnable {
+        scheduledReleaseAtNs = FramePacer.NONE
+        onHeldDue()
+    }
     private val pacerReset = Runnable { resetPacer() }
     private val tick = object : Runnable {
         override fun run() {
@@ -322,8 +327,13 @@ class VideoDecoder @JvmOverloads constructor(
      * 提前建解码器只能省下一次一百毫秒左右的启动时间。任意线程。
      */
     fun prepare(width: Int, height: Int, fps: Int) {
+        if (closed) return
         lock.withLock { if (fps > 0) hintFps = fps }
-        if (width > 0 && height > 0) handler.post { DecoderCatalog.candidates(width, height) }
+        if (width > 0 && height > 0) {
+            handler.post {
+                if (!closed) DecoderCatalog.candidates(width, height)
+            }
+        }
     }
 
     /**
@@ -332,9 +342,10 @@ class VideoDecoder @JvmOverloads constructor(
      * 提前量按一个周期估，相位可能偏，节拍的效果打折扣。
      */
     fun setDisplayTiming(timing: DisplayTiming?) {
-        if (timing == displayTiming) return
+        if (closed || timing == displayTiming) return
         displayTiming = timing
         handler.post {
+            if (closed) return@post
             vsyncGrid.setNominalPeriod(timing?.refreshPeriodNs ?: 0)
             Log.i(TAG, "屏幕刷新时序：${timing ?: "不知道"}")
         }
@@ -497,7 +508,11 @@ class VideoDecoder @JvmOverloads constructor(
         waitingForSync = false
 
         val nowMs = now()
-        if (scan.isSyncPoint) startChainLocked(nowMs)
+        if (scan.isSyncPoint) {
+            startChainLocked(nowMs)
+        } else if (!cache.historyComplete && cache.pendingEntries == 0 && !flushing && length <= options.cacheMaxBytes) {
+            if (tryFeedDirectLocked(data, offset, length, streamPtsUs, nowMs)) return true
+        }
         when (cache.append(data, offset, length, scan.isParameterSetsOnly, nowMs, streamPtsUs)) {
             FrameCache.REJECTED -> {
                 // 已经送进去和排在前面的帧照样送：解码器的参考帧还是对的，只是这一帧以后的接不上了。
@@ -514,6 +529,47 @@ class VideoDecoder @JvmOverloads constructor(
         return true
     }
 
+    /** 缓存已超过重放上限且当前没有排队待送条目时，直接写进空闲输入缓冲，省掉经过 FrameCache 的二次整帧拷贝。 */
+    private fun tryFeedDirectLocked(data: ByteArray, offset: Int, length: Int, streamPtsUs: Long, nowMs: Long): Boolean {
+        val c = codec ?: return false
+        if (c === retiringCodec) return false
+        while (true) {
+            val index = freeInputs.peekFirst() ?: return false
+            val buffer: ByteBuffer? = try {
+                c.getInputBuffer(index)
+            } catch (e: IllegalStateException) {
+                null
+            }
+            if (buffer == null) {
+                freeInputs.pollFirst()
+                Log.w(TAG, "输入缓冲 $index 已经失效，跳过")
+                continue
+            }
+            if (length > buffer.capacity()) return false
+            freeInputs.pollFirst()
+            val config = scan.isParameterSetsOnly
+            try {
+                buffer.clear()
+                buffer.put(data, offset, length)
+                val ptsUs = if (options.useStreamTimestamps && streamPtsUs >= 0) streamPtsUs else nextPtsUs()
+                c.queueInputBuffer(index, 0, length, ptsUs, if (config) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0)
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "送入解码器失败，换解码器", e)
+                retireLocked(c, ResyncReason.DECODER_ERROR)
+                if (!config) stats.onDropped()
+                return true
+            }
+            if (!config) {
+                if (freshFedByCodec < LOG_FIRST_FEEDS) {
+                    freshFedByCodec++
+                    Log.i(TAG, "解码器收下第 $freshFedByCodec 帧：到达后等了 0ms")
+                }
+                stats.onQueued(nowMs)
+            }
+            return true
+        }
+    }
+
     /** 能开始解码的帧到了：缓存从它重新开始，段首先存一份当前的参数集。 */
     private fun startChainLocked(nowMs: Long) {
         val lost = cache.startChain()
@@ -523,7 +579,7 @@ class VideoDecoder @JvmOverloads constructor(
         }
         // 解码器手里已经有这份参数集，所以记为已送，只在重放时先送它：flush 后有的解码器要重新给参数集，
         // 这一段中途换过参数集时也不会拿新的去解前面的帧。
-        val config = params.csd0() + params.csd1()
+        val config = params.combinedCsd()
         cache.append(config, 0, config.size, config = true, nowMs = nowMs, delivered = true)
     }
 
@@ -636,7 +692,10 @@ class VideoDecoder @JvmOverloads constructor(
         freeInputs.clear()
         presenter.drop()
         forgetHeld()
-        handler.removeCallbacks(holdTimeout)
+        if (holdTimeoutScheduled) {
+            holdTimeoutScheduled = false
+            handler.removeCallbacks(holdTimeout)
+        }
         stats.onDecoderReset(now())
         replays.reset()
         cache.rewind(now())
@@ -660,6 +719,7 @@ class VideoDecoder @JvmOverloads constructor(
 
     /** 解码线程：扣着的重放帧一段时间没等来下一个（解码器可能扣着最后一帧），先把它上屏。 */
     private fun onReplayHoldTimeout() {
+        holdTimeoutScheduled = false
         val c = codec
         if (c == null || c !== outputCodec || flushing) {
             presenter.drop()
@@ -729,8 +789,18 @@ class VideoDecoder @JvmOverloads constructor(
     }
 
     private fun scheduleHeadRelease(nowNs: Long) {
-        handler.removeCallbacks(heldDue)
-        if (pacer.queued > 0) handler.postDelayed(heldDue, ceilMs(pacer.nextReleaseAtNs - nowNs))
+        if (pacer.queued <= 0) {
+            if (scheduledReleaseAtNs != FramePacer.NONE) {
+                scheduledReleaseAtNs = FramePacer.NONE
+                handler.removeCallbacks(heldDue)
+            }
+            return
+        }
+        val targetNs = pacer.nextReleaseAtNs
+        if (targetNs == scheduledReleaseAtNs) return
+        if (scheduledReleaseAtNs != FramePacer.NONE) handler.removeCallbacks(heldDue)
+        scheduledReleaseAtNs = targetNs
+        handler.postDelayed(heldDue, ceilMs(targetNs - nowNs))
     }
 
     /** 送出队首扣着的帧：输出不在视图 Surface 上就不上屏；解码器已经换了、正在 flush 就只出队、不送。 */
@@ -750,7 +820,10 @@ class VideoDecoder @JvmOverloads constructor(
      * 它出帧时已经算作手机发来的新画面（[freshFramesShown]），切回投屏页的重放会因此跳过，不上屏就会停在旧画面上。
      */
     private fun resetPacer() {
-        handler.removeCallbacks(heldDue)
+        if (scheduledReleaseAtNs != FramePacer.NONE) {
+            scheduledReleaseAtNs = FramePacer.NONE
+            handler.removeCallbacks(heldDue)
+        }
         val c = outputCodec
         if (c != null && c === codec && !flushing) {
             val visible = !outputOnPlaceholder
@@ -762,7 +835,10 @@ class VideoDecoder @JvmOverloads constructor(
 
     /** 扣着的序号已经失效（flush 了，或者换了解码器）：只忘掉，不还；节拍从头来。 */
     private fun forgetHeld() {
-        handler.removeCallbacks(heldDue)
+        if (scheduledReleaseAtNs != FramePacer.NONE) {
+            scheduledReleaseAtNs = FramePacer.NONE
+            handler.removeCallbacks(heldDue)
+        }
         pacer.reset()
     }
 
@@ -791,6 +867,7 @@ class VideoDecoder @JvmOverloads constructor(
             gridLogged = true
             Log.i(TAG, "拿到刷新节拍：周期 ${vsyncGrid.periodNs}ns，送显提前量 ${deadlineNs()}ns，上屏节拍${if (framePacing) "开" else "关"}")
         }
+        if (pacer.queued > 0) onHeldDue()
         if (now - lastShowNs < VSYNC_IDLE_NS) requestVsync()
     }
 
@@ -1110,8 +1187,14 @@ class VideoDecoder @JvmOverloads constructor(
             }
             val visible = !outputOnPlaceholder
             val kind = replays.classify(info.presentationTimeUs)
-            handler.removeCallbacks(holdTimeout)
-            if (presenter.onOutput(index, kind, visible)) handler.postDelayed(holdTimeout, DecoderTiming.REPLAY_HOLD_MS)
+            if (holdTimeoutScheduled) {
+                holdTimeoutScheduled = false
+                handler.removeCallbacks(holdTimeout)
+            }
+            if (presenter.onOutput(index, kind, visible)) {
+                holdTimeoutScheduled = true
+                handler.postDelayed(holdTimeout, DecoderTiming.REPLAY_HOLD_MS)
+            }
             when (kind) {
                 ReplayTracker.FRESH -> {
                     if (visible) freshFramesShown++

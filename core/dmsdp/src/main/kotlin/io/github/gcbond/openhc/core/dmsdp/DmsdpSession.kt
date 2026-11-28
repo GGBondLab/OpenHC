@@ -581,7 +581,7 @@ class DmsdpSession(
 
     private fun sendText(text: ByteArray, out: Outputs) {
         val frame = if (controlState == ControlState.ENCRYPTED) {
-            ControlFrames.encode(ControlFrames.FLAG_ENCRYPTED, cipher.seal(random, text))
+            sealControlFrame(text)
         } else {
             ControlFrames.encode(ControlFrames.FLAG_PLAIN, text)
         }
@@ -595,7 +595,18 @@ class DmsdpSession(
 
     private fun sendRecord(module: Long, type: Int, data: ByteArray, out: Outputs) {
         val record = DeviceRecords.encode(module, type, data)
-        out.send(DmsdpChannel.CONTROL, ControlFrames.encode(ControlFrames.FLAG_ENCRYPTED, cipher.seal(random, record)))
+        out.send(DmsdpChannel.CONTROL, sealControlFrame(record))
+    }
+
+    private fun sealControlFrame(plain: ByteArray): ByteArray {
+        val payloadLen = AesCtr.IV_BYTES + plain.size
+        require(payloadLen <= ControlFrames.MAX_PAYLOAD) { "控制帧载荷超长: $payloadLen" }
+        val frame = ByteArray(ControlFrames.HEADER_BYTES + payloadLen)
+        frame[0] = ControlFrames.FLAG_ENCRYPTED.toByte()
+        frame[1] = (payloadLen ushr 8).toByte()
+        frame[2] = payloadLen.toByte()
+        cipher.sealInto(random, plain, 0, plain.size, frame, ControlFrames.HEADER_BYTES)
+        return frame
     }
 
     // ---------------- 工具 ----------------
@@ -606,7 +617,7 @@ class DmsdpSession(
     private inline fun audioQuietly(out: Outputs, block: () -> Unit) {
         try {
             block()
-        } catch (e: RuntimeException) {
+        } catch (e: Exception) {
             out.event(DmsdpEvent.AudioNote("音频处理出错（${e.javaClass.simpleName}：${e.message}），已忽略"))
         }
     }
@@ -635,9 +646,12 @@ class DmsdpSession(
     }
 
     internal class Outputs {
-        val list = ArrayList<DmsdpOutput>()
+        private var items: ArrayList<DmsdpOutput>? = null
+        val list: List<DmsdpOutput> get() = items ?: emptyList()
+
         fun add(output: DmsdpOutput) {
-            list += output
+            val target = items ?: ArrayList<DmsdpOutput>(4).also { items = it }
+            target += output
         }
 
         fun send(channel: DmsdpChannel, bytes: ByteArray) = add(DmsdpAction.Send(channel, bytes))

@@ -66,6 +66,7 @@ class KotlinAccessoryAuthenticator(
     private val peerId = config.peerAuthId.toByteArray(Charsets.US_ASCII)
     private val pin: ByteArray? = config.pin
     private val identity: LocalIdentity
+    private val initialPeer: TrustedPeer?
     override val peerTrusted: Boolean
 
     private var state = State.INIT
@@ -82,7 +83,8 @@ class KotlinAccessoryAuthenticator(
     init {
         identity = trustStore.findLocalIdentity(serviceId, selfId)
             ?: LocalIdentity(serviceId, selfId, random.draw(Ed25519Keys.KEY_LENGTH))
-        peerTrusted = trustStore.findPeer(serviceId, peerId) != null
+        initialPeer = trustStore.findPeer(serviceId, peerId)
+        peerTrusted = initialPeer != null
     }
 
     @Throws(MalformedMessageException::class)
@@ -258,7 +260,7 @@ class KotlinAccessoryAuthenticator(
                 if (sts == null) {
                     if (pake != null || pakeClientBuilt) throw HcFailure(HcError.REPEATED_REFERENCE)
                     sts = StsServer(selfId, peerId, SESSION_KEY_LENGTH, identity, random) {
-                        trustStore.findPeer(serviceId, peerId)?.publicKey
+                        (initialPeer ?: trustStore.findPeer(serviceId, peerId))?.publicKey
                     }
                 }
             } else {
@@ -368,8 +370,8 @@ class KotlinAccessoryAuthenticator(
          * 同步执行，不开线程；建议平台层在应用启动后挑个后台线程调用一次，避免拖慢手机的首次握手应答。
          */
         fun warmUp() {
-            Ed25519Keys.sign(ByteArray(Ed25519Keys.KEY_LENGTH), ByteArray(0))
-            X25519Keys.publicKey(ByteArray(X25519Keys.KEY_LENGTH))
+            Ed25519Keys.warmUp()
+            X25519Keys.warmUp()
             Modp.modPow(byteArrayOf(2), byteArrayOf(2), Modp.LENGTH_3072)
             HiChainBuild.inform(0)
         }

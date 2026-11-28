@@ -6,7 +6,7 @@ import android.content.Intent
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
+import io.github.gcbond.openhc.platform.log.Log
 import java.lang.ref.WeakReference
 
 /**

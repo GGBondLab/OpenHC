@@ -19,6 +19,7 @@ import javax.crypto.spec.SecretKeySpec
  */
 internal class NearbyFrameCipher(keys: NearbyKeyMaterial) {
     private val derivedRoot: ByteArray
+    private val mac: Mac
 
     init {
         val a = keys.constA
@@ -28,6 +29,7 @@ internal class NearbyFrameCipher(keys: NearbyKeyMaterial) {
         require(n >= MIN_KEY_MATERIAL) { "nearby 密钥材料每段至少 $MIN_KEY_MATERIAL 字节，实际 $n 字节" }
         val h1 = ByteArray(n) { i -> (a[(i + 3) % n].toInt() xor b[i].toInt()).toByte() }
         derivedRoot = ByteArray(n) { i -> (h1[(i - 5 + n) % n].toInt() xor root[i].toInt()).toByte() }
+        mac = Mac.getInstance(HMAC).apply { init(SecretKeySpec(derivedRoot, HMAC)) }
         a.fill(0)
         b.fill(0)
         root.fill(0)
@@ -67,8 +69,6 @@ internal class NearbyFrameCipher(keys: NearbyKeyMaterial) {
 
     private fun frameKey(seed: ByteArray): ByteArray {
         require(seed.size == NearbyFrame.SEED_LENGTH) { "种子应为 ${NearbyFrame.SEED_LENGTH} 字节" }
-        val mac = Mac.getInstance(HMAC)
-        mac.init(SecretKeySpec(derivedRoot, HMAC))
         return mac.doFinal(seed)
     }
 

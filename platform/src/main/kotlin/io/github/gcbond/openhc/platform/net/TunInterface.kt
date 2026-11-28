@@ -29,6 +29,14 @@ internal class TunInterface(private val descriptor: ParcelFileDescriptor) : Pack
     private var wakeSignalled = false
     private var closed = false
 
+    private val tunReadPoll: StructPollfd
+    private val wakeReadPoll: StructPollfd
+    private val readFds: Array<StructPollfd>
+
+    private val tunWritePoll: StructPollfd
+    private val wakeWritePoll: StructPollfd
+    private val writeFds: Array<StructPollfd>
+
     init {
         val pipe = try {
             Os.pipe()
@@ -37,29 +45,40 @@ internal class TunInterface(private val descriptor: ParcelFileDescriptor) : Pack
         }
         wakeRead = pipe[0]
         wakeWrite = pipe[1]
-    }
-
-    override fun read(buffer: ByteArray, offset: Int, maxLength: Int): Int {
-        val tunPoll = StructPollfd().apply {
+        tunReadPoll = StructPollfd().apply {
             fd = this@TunInterface.fd
             events = OsConstants.POLLIN.toShort()
         }
-        val wakePoll = StructPollfd().apply {
+        wakeReadPoll = StructPollfd().apply {
             fd = wakeRead
             events = OsConstants.POLLIN.toShort()
         }
-        val fds = arrayOf(tunPoll, wakePoll)
+        readFds = arrayOf(tunReadPoll, wakeReadPoll)
+        tunWritePoll = StructPollfd().apply {
+            fd = this@TunInterface.fd
+            events = OsConstants.POLLOUT.toShort()
+        }
+        wakeWritePoll = StructPollfd().apply {
+            fd = wakeRead
+            events = OsConstants.POLLIN.toShort()
+        }
+        writeFds = arrayOf(tunWritePoll, wakeWritePoll)
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, maxLength: Int): Int {
         while (!woken) {
+            tunReadPoll.revents = 0
+            wakeReadPoll.revents = 0
             val ready = try {
                 // 有唤醒管道时本可以无限等；留一个超时只是兜底，防止唤醒信号意外丢失时线程永远不退出。
-                Os.poll(fds, POLL_TIMEOUT_MS)
+                Os.poll(readFds, POLL_TIMEOUT_MS)
             } catch (e: ErrnoException) {
                 if (e.errno == OsConstants.EINTR) continue
                 return -1
             }
-            if (woken || wakePoll.revents.toInt() != 0) return -1
+            if (woken || wakeReadPoll.revents.toInt() != 0) return -1
             if (ready <= 0) continue
-            val events = tunPoll.revents.toInt()
+            val events = tunReadPoll.revents.toInt()
             if (events and OsConstants.POLLIN != 0) {
                 try {
                     val n = Os.read(fd, buffer, offset, maxLength)
@@ -78,14 +97,27 @@ internal class TunInterface(private val descriptor: ParcelFileDescriptor) : Pack
     }
 
     override fun write(buffer: ByteArray, offset: Int, length: Int): Boolean {
-        if (woken) return false
-        return try {
-            Os.write(fd, buffer, offset, length) == length
-        } catch (e: ErrnoException) {
-            false
-        } catch (e: InterruptedIOException) {
-            false
+        var waits = 0
+        while (!woken) {
+            try {
+                return Os.write(fd, buffer, offset, length) == length
+            } catch (e: ErrnoException) {
+                if (e.errno == OsConstants.EINTR) continue
+                if (e.errno != OsConstants.EAGAIN || waits >= MAX_WRITE_WAITS) return false
+                waits++
+                tunWritePoll.revents = 0
+                wakeWritePoll.revents = 0
+                try {
+                    Os.poll(writeFds, WRITE_WAIT_MS)
+                } catch (pe: ErrnoException) {
+                    if (pe.errno != OsConstants.EINTR) return false
+                }
+                if (woken || wakeWritePoll.revents.toInt() != 0) return false
+            } catch (e: InterruptedIOException) {
+                return false
+            }
         }
+        return false
     }
 
     override fun wakeup() {
@@ -129,6 +161,8 @@ internal class TunInterface(private val descriptor: ParcelFileDescriptor) : Pack
 
     private companion object {
         const val POLL_TIMEOUT_MS = 1000
+        const val WRITE_WAIT_MS = 5
+        const val MAX_WRITE_WAITS = 6
         val WAKE_BYTE = byteArrayOf(1)
     }
 }

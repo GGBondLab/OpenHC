@@ -46,12 +46,13 @@ fun AudioUsage.trackAttributes(): TrackAttributes {
             .setContentType(CAR_NAVIGATION_CONTENT_TYPE)
             .build()
         val kept = car.usage == AudioAttributes.USAGE_MEDIA && car.contentType == CAR_NAVIGATION_CONTENT_TYPE
-        val note = if (kept) {
-            "车机导航声道（用途媒体 + 内容类型 $CAR_NAVIGATION_CONTENT_TYPE）"
-        } else {
-            "系统没认下车机扩展的导航内容类型（读回用途 ${car.usage}、内容类型 ${car.contentType}），多半跟媒体音量走"
+        if (!kept) {
+            return TrackAttributes(
+                attributes(),
+                "系统没认下车机扩展的导航内容类型（读回用途 ${car.usage}、内容类型 ${car.contentType}），退回标准导航用途",
+            )
         }
-        TrackAttributes(car, note)
+        TrackAttributes(car, "车机导航声道（用途媒体 + 内容类型 $CAR_NAVIGATION_CONTENT_TYPE）")
     } catch (e: IllegalArgumentException) {
         TrackAttributes(attributes(), "标准导航用途（系统不认车机扩展的导航内容类型）")
     }

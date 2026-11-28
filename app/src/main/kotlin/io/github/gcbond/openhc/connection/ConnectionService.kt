@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -35,6 +36,7 @@ class ConnectionService : Service() {
     /** 自己要退出（调度不再要求前台）：销毁时不用再通知调度。 */
     private var leaving = false
     private var lastNotification: NotificationContent? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val listener = ConnectionController.HostListener { onControllerChanged() }
 
@@ -43,6 +45,12 @@ class ConnectionService : Service() {
         controller = (application as OpenHcApp).connection
         controller.addHostListener(listener)
         createChannel()
+        try {
+            val pm = applicationContext.getSystemService(POWER_SERVICE) as? PowerManager
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenHC:Wired")?.apply { setReferenceCounted(false) }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "创建有线 WakeLock 失败：${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -57,6 +65,7 @@ class ConnectionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        releaseWakeLock()
         controller.removeHostListener(listener)
         if (inForeground) controller.serviceInForeground = false
         if (!leaving) controller.onServiceDestroyed()
@@ -70,6 +79,11 @@ class ConnectionService : Service() {
             inForeground = true
             controller.serviceInForeground = true
             lastNotification = content
+            try {
+                if (wakeLock?.isHeld == false) wakeLock?.acquire()
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "申请有线 WakeLock 失败：${e.message}")
+            }
             true
         } catch (e: RuntimeException) {
             // 安卓 12 起后台启动被拒（ForegroundServiceStartNotAllowedException）、安卓 14 起前置条件不满足（SecurityException）。
@@ -105,6 +119,7 @@ class ConnectionService : Service() {
     private fun leave() {
         if (leaving) return
         leaving = true
+        releaseWakeLock()
         if (inForeground) {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             inForeground = false
@@ -112,6 +127,14 @@ class ConnectionService : Service() {
         }
         // 只在没有更新的启动请求时才真的停：调度刚放手又马上要求前台时，新的请求还排在后面。
         stopSelf(lastStartId)
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (e: RuntimeException) {
+            // 忽略。
+        }
     }
 
     private fun createChannel() {

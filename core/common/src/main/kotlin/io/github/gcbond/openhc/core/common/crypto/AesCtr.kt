@@ -3,6 +3,7 @@ package io.github.gcbond.openhc.core.common.crypto
 import io.github.gcbond.openhc.core.common.MalformedMessageException
 import java.security.SecureRandom
 import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
@@ -10,25 +11,31 @@ import javax.crypto.spec.SecretKeySpec
  *
  * - **计数器**：初始计数器块就是 16 字节 IV；每处理一块（16 字节），计数器按 128 位**大端**无符号整数
  *   整体加一，2^128 − 1 之后回绕到 0。这与 JCE 的 `AES/CTR/NoPadding`、OpenSSL 的 CTR 模式相同。
- *   计数器在 AES/ECB 上自己实现，结果不依赖 JCE 提供者对进位的处理。
+ *   常规不发生低 32 位溢出的大块数据直接走底层硬件加速的 `AES/CTR/NoPadding`，跨 32 位进位边界时回退到
+ *   在 AES/ECB 上自己实现的 128 位计数器，结果不依赖 JCE 提供者对进位的处理。
  * - 加密和解密是同一个运算（输入异或密钥流），没有填充，也没有认证标签，输出与输入等长。
  * - [seal] / [open] 处理自带 IV 的加密单元：`IV(16) ‖ 密文`。
  *
- * 按 4 KiB 一段生成密钥流，复用实例里的缓冲区，不随数据长度分配内存。所以**不是线程安全的**：
+ * 复用实例里的缓冲区，不随数据长度分配内存。所以**不是线程安全的**：
  * 同一实例同一时间只能在一个线程里用。
  *
  * @param key 16 字节 AES-128 密钥，长度不对抛 [IllegalArgumentException]。
  */
 class AesCtr(key: ByteArray) {
+    private val secretKey: SecretKeySpec
+    private val ctr: Cipher
     private val ecb: Cipher
+    private val ivScratch = ByteArray(IV_BYTES)
     private val counter = ByteArray(BLOCK_BYTES)
     private val counterBlocks = ByteArray(CHUNK_BYTES)
     private val keystream = ByteArray(CHUNK_BYTES)
 
     init {
         require(key.size == KEY_BYTES) { "AES-128 密钥必须是 $KEY_BYTES 字节" }
+        secretKey = SecretKeySpec(key, "AES")
+        ctr = Cipher.getInstance("AES/CTR/NoPadding")
         ecb = Cipher.getInstance("AES/ECB/NoPadding")
-        ecb.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"))
+        ecb.init(Cipher.ENCRYPT_MODE, secretKey)
     }
 
     /**
@@ -48,6 +55,18 @@ class AesCtr(key: ByteArray) {
         requireRange(input, inOffset, length, "输入")
         requireRange(output, outOffset, length, "输出")
         if (length == 0) return
+        if (length >= FAST_CTR_MIN_BYTES) {
+            val low32 = ((iv[ivOffset + 12].toLong() and 0xFF) shl 24) or
+                ((iv[ivOffset + 13].toLong() and 0xFF) shl 16) or
+                ((iv[ivOffset + 14].toLong() and 0xFF) shl 8) or
+                (iv[ivOffset + 15].toLong() and 0xFF)
+            val blocks = (length.toLong() + BLOCK_BYTES - 1) / BLOCK_BYTES
+            if (low32 + blocks <= 0xFFFF_FFFFL) {
+                ctr.init(Cipher.ENCRYPT_MODE, secretKey, IvParameterSpec(iv, ivOffset, IV_BYTES))
+                ctr.doFinal(input, inOffset, length, output, outOffset)
+                return
+            }
+        }
         System.arraycopy(iv, ivOffset, counter, 0, IV_BYTES)
         var done = 0
         while (done < length) {
@@ -75,12 +94,25 @@ class AesCtr(key: ByteArray) {
      */
     fun seal(random: SecureRandom, plain: ByteArray, offset: Int = 0, length: Int = plain.size - offset): ByteArray {
         requireRange(plain, offset, length, "明文")
-        val iv = ByteArray(IV_BYTES)
-        random.nextBytes(iv)
         val out = ByteArray(IV_BYTES + length)
-        System.arraycopy(iv, 0, out, 0, IV_BYTES)
-        transform(iv, 0, plain, offset, length, out, IV_BYTES)
+        sealInto(random, plain, offset, length, out, 0)
         return out
+    }
+
+    /**
+     * 把 `plain[plainOffset, +length)` 加密成 `IV(16) ‖ 密文` 直接写入 `dest[destOffset, +16+length)`。
+     * 支持 `plain === dest && plainOffset == destOffset + IV_BYTES` 的原地封装。
+     */
+    fun sealInto(
+        random: SecureRandom,
+        plain: ByteArray, plainOffset: Int, length: Int,
+        dest: ByteArray, destOffset: Int,
+    ) {
+        requireRange(plain, plainOffset, length, "明文")
+        requireRange(dest, destOffset, IV_BYTES + length, "输出")
+        random.nextBytes(ivScratch)
+        System.arraycopy(ivScratch, 0, dest, destOffset, IV_BYTES)
+        transform(ivScratch, 0, plain, plainOffset, length, dest, destOffset + IV_BYTES)
     }
 
     /**
@@ -107,6 +139,7 @@ class AesCtr(key: ByteArray) {
         const val IV_BYTES = 16
 
         private const val BLOCK_BYTES = 16
+        private const val FAST_CTR_MIN_BYTES = 512
 
         /** 一次生成的密钥流长度，必须是块长的整数倍。 */
         private const val CHUNK_BYTES = 4096

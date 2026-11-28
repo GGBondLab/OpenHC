@@ -71,14 +71,16 @@ class WirelessReceiverSession internal constructor(
     }
 
     private class Out {
-        val list = ArrayList<WirelessOutput>(4)
+        private var items: ArrayList<WirelessOutput>? = null
+        val list: List<WirelessOutput> get() = items ?: emptyList()
 
         fun add(output: WirelessOutput) {
-            list += output
+            val target = items ?: ArrayList<WirelessOutput>(4).also { items = it }
+            target += output
         }
 
         fun common(output: SessionOutput) {
-            list += WirelessOutput.Common(output)
+            add(WirelessOutput.Common(output))
         }
     }
 
@@ -160,11 +162,21 @@ class WirelessReceiverSession internal constructor(
     val nextTickAtMillis: Long?
         get() {
             if (ended) return null
-            val handshake = nearby?.takeIf { control?.state == State.OPEN }?.nextTickAtMillis
-            return listOfNotNull(
-                handshake, reconnectDeadline, authAcceptDeadline, authDeadline, networkDeadline, joinDeadline, wired?.nextTickAtMillis,
-            ).minOrNull()
+            var min = nearby?.takeIf { control?.state == State.OPEN }?.nextTickAtMillis
+            min = minDeadline(min, reconnectDeadline)
+            min = minDeadline(min, authAcceptDeadline)
+            min = minDeadline(min, authDeadline)
+            min = minDeadline(min, networkDeadline)
+            min = minDeadline(min, joinDeadline)
+            min = minDeadline(min, wired?.nextTickAtMillis)
+            return min
         }
+
+    private fun minDeadline(a: Long?, b: Long?): Long? = when {
+        a == null -> b
+        b == null -> a
+        else -> minOf(a, b)
+    }
 
     /** WiFi 阶段内嵌的有线编排器已经交给视频回调的帧数。 */
     val videoFrames: Long get() = wired?.videoFrames ?: 0L
@@ -458,7 +470,13 @@ class WirelessReceiverSession internal constructor(
     fun sendInput(input: HiSightInput): List<WirelessOutput> {
         if (ended) return emptyList()
         val w = wired ?: return emptyList()
-        return w.sendInput(input).map { WirelessOutput.Common(it) }
+        val outputs = w.sendInput(input)
+        return if (outputs.isEmpty()) emptyList() else outputs.map { WirelessOutput.Common(it) }
+    }
+
+    internal fun sendInputDirect(input: HiSightInput): List<SessionOutput> {
+        if (ended) return emptyList()
+        return wired?.sendInput(input) ?: emptyList()
     }
 
     /** 把车机的音频焦点变化告诉手机，规则同 [ReceiverSession.sendAudioFocus]；WiFi 阶段之前返回空列表。 */
@@ -899,6 +917,7 @@ class WirelessReceiverSession internal constructor(
     private fun close(ep: Endpoint?, out: Out) {
         if (ep == null || ep.state == State.CLOSED) return
         ep.state = State.CLOSED
+        endpoints.remove(ep.id)
         out.add(if (ep.channel == WirelessChannel.WIFI_NETWORK) WirelessAction.StopWifiNetwork(ep.id) else WirelessAction.RfcommClose(ep.id))
     }
 

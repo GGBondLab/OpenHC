@@ -7,6 +7,11 @@
     <string name="settings_boot_wired">开机打开 OpenHC 后等插线，插上手机就连接。</string>
     <string name="settings_boot_wireless_both">开着「插线时不再弹窗」：开机后打开 OpenHC，自动连上次用无线连过的手机（手机蓝牙要连着车机）；插上手机（或开机时已经插着）就改走有线。</string>
     <string name="settings_boot_wireless_blocked">没开「插线时不再弹窗」：开机后进入等插线；用无线连过的手机蓝牙连上车机时，改走无线自动连接。</string>
+    <string name="settings_boot_overlay_title">悬浮窗权限</string>
+    <string name="settings_boot_overlay_badge_ok">已开启</string>
+    <string name="settings_boot_overlay_badge_missing">待开启</string>
+    <string name="settings_boot_overlay_badge_none">无需配置</string>
+    <string name="settings_boot_overlay_action">去开启</string>
     <string name="settings_boot_overlay_granted">悬浮窗权限：已允许</string>
     <string name="settings_boot_overlay_missing">还差悬浮窗权限：没有它，开机和自动连接时打不开 OpenHC。点这里去开；找不到的话，在车机系统设置的「应用」里找到 OpenHC，打开「悬浮窗」或「显示在其他应用上层」。</string>
     <string name="settings_boot_overlay_not_needed">这台车机是安卓 %1$s，不需要悬浮窗权限。</string>
@@ -41,4 +46,6 @@
     <string name="settings_boot_silent_wireless_both">开机后不打开首页，在后台待命：用无线连过的手机蓝牙连上车机时，打开 OpenHC 自动连接；插上手机（或开机时已经插着）就改走有线。</string>
     <string name="settings_boot_silent_wireless_blocked">开机后不打开首页，在后台等插线；用无线连过的手机蓝牙连上车机时，打开 OpenHC 改走无线自动连接。</string>
     <string name="settings_boot_overlay_missing_silent">还差悬浮窗权限：没有它，手机连上时投屏画面出不来。点这里去开；找不到的话，在车机系统设置的「应用」里找到 OpenHC，打开「悬浮窗」或「显示在其他应用上层」。</string>
+    <string name="home_banner_byd_autostart">本次安装或更新后还没收到开机广播：比亚迪每次更新都会重新开启「禁止后台启动项」，请关掉 OpenHC 的开关，开机自启动与蓝牙自动重连才能生效。</string>
+    <string name="home_banner_byd_autostart_action">去放行</string>
 </resources>

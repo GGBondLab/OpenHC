@@ -79,15 +79,24 @@ public final class HotspotSwitchMain {
                 Object connectivity = service("connectivity", "android.net.IConnectivityManager$Stub");
                 Method state = wifi == null ? null : find(wifi, "getWifiApEnabledState");
                 Method tethered = connectivity == null ? null : find(connectivity, "getTetheredIfaces");
-                Method start = connectivity == null ? null
+                Method start4 = connectivity == null ? null
                     : find(connectivity, "startTethering", int.class, ResultReceiver.class, boolean.class, String.class);
-                Method stop = connectivity == null ? null : find(connectivity, "stopTethering", int.class, String.class);
+                Method start3 = (connectivity == null || start4 != null) ? null
+                    : find(connectivity, "startTethering", int.class, ResultReceiver.class, boolean.class);
+                Method start = start4 != null ? start4 : start3;
+                Method stop2 = connectivity == null ? null : find(connectivity, "stopTethering", int.class, String.class);
+                Method stop1 = (connectivity == null || stop2 != null) ? null : find(connectivity, "stopTethering", int.class);
+                Method stop = stop2 != null ? stop2 : stop1;
                 if (state == null || tethered == null || start == null || stop == null) {
                     result = "UNSUPPORTED";
                 } else if (CHECK.equals(args[0])) {
                     result = "READY";
                 } else if (STOP.equals(args[0])) {
-                    stop.invoke(connectivity, TETHERING_WIFI, SHELL_PACKAGE);
+                    if (stop.getParameterTypes().length == 2) {
+                        stop.invoke(connectivity, TETHERING_WIFI, SHELL_PACKAGE);
+                    } else {
+                        stop.invoke(connectivity, TETHERING_WIFI);
+                    }
                     result = "DONE";
                 } else {
                     String[] outcome = start(wifi, state, connectivity, tethered, start);
@@ -119,7 +128,11 @@ public final class HotspotSwitchMain {
                 answered.countDown();
             }
         };
-        start.invoke(connectivity, TETHERING_WIFI, receiver, false, SHELL_PACKAGE);
+        if (start.getParameterTypes().length == 4) {
+            start.invoke(connectivity, TETHERING_WIFI, receiver, false, SHELL_PACKAGE);
+        } else {
+            start.invoke(connectivity, TETHERING_WIFI, receiver, false);
+        }
         answered.await(RESULT_WAIT_MS, TimeUnit.MILLISECONDS);
         // 0 是成功；没回结果时照样看热点状态。
         if (code.get() != NO_ANSWER && code.get() != 0) return new String[]{"FAILED", "code=" + code.get()};

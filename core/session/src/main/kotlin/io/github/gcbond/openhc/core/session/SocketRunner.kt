@@ -10,10 +10,11 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
 
 /**
  * 用 java.net 阻塞 I/O 执行 [SessionLogic] 给出的动作，安卓和电脑通用（不引用安卓类）。
@@ -55,6 +56,8 @@ class SocketRunner(
         val threadName: String = "openhc-session",
         /** 执行器自己的诊断日志（不含收发的内容）。 */
         val log: (String) -> Unit = {},
+        /** 执行器已彻底结束（全部资源与线程收尾完毕）后的可选通知回调，省去外部单独阻塞等待守护线程。 */
+        val onTerminated: () -> Unit = {},
     ) {
         init {
             require(connectTimeoutMillis > 0) { "connectTimeoutMillis 必须为正" }
@@ -76,9 +79,53 @@ class SocketRunner(
         object Stop : Input()
     }
 
-    /** 一条连接的读缓冲：固定几块轮流用。 */
+    /** 双优先级输入队列：控制、音频与交互任务优先于视频大数据块出队；同优先级内部严格先进先出。 */
+    private class InputQueue {
+        private val lock = ReentrantLock()
+        private val notEmpty = lock.newCondition()
+        private val high = java.util.ArrayDeque<Input>()
+        private val normal = java.util.ArrayDeque<Input>()
+
+        fun add(input: Input, highPriority: Boolean) {
+            lock.lock()
+            try {
+                val wasEmpty = high.isEmpty() && normal.isEmpty()
+                if (highPriority) high.addLast(input) else normal.addLast(input)
+                if (wasEmpty) notEmpty.signal()
+            } finally {
+                lock.unlock()
+            }
+        }
+
+        fun poll(): Input? {
+            lock.lock()
+            try {
+                return high.pollFirst() ?: normal.pollFirst()
+            } finally {
+                lock.unlock()
+            }
+        }
+
+        fun poll(timeoutMillis: Long): Input? {
+            var remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
+            lock.lock()
+            try {
+                while (true) {
+                    val next = high.pollFirst() ?: normal.pollFirst()
+                    if (next != null) return next
+                    if (remaining <= 0L) return null
+                    remaining = notEmpty.awaitNanos(remaining)
+                }
+            } finally {
+                lock.unlock()
+            }
+        }
+    }
+
+    /** 一条连接的读缓冲：固定几块轮流用。资源关闭时放入零长哨兵唤醒阻塞读线程，日常无超时轮询开销。 */
     private class BufferPool(count: Int, size: Int) {
-        private val free = ArrayBlockingQueue<ByteArray>(count)
+        private val free = ArrayBlockingQueue<ByteArray>(count + 1)
+        private val closedFlag = AtomicBoolean(false)
 
         init {
             repeat(count) { free.add(ByteArray(size)) }
@@ -86,55 +133,180 @@ class SocketRunner(
 
         /** 等一块空闲缓冲；资源已关闭时返回 null。 */
         fun take(closed: AtomicBoolean): ByteArray? {
-            while (!closed.get()) {
-                val buffer = try {
-                    free.poll(POOL_WAIT_MILLIS, TimeUnit.MILLISECONDS)
-                } catch (e: InterruptedException) {
-                    return null
-                }
-                if (buffer != null) return buffer
+            if (closed.get() || closedFlag.get()) return null
+            val buffer = try {
+                free.take()
+            } catch (e: InterruptedException) {
+                return null
             }
-            return null
+            if (buffer === SENTINEL || closed.get() || closedFlag.get()) {
+                if (buffer === SENTINEL) free.offer(SENTINEL)
+                return null
+            }
+            return buffer
         }
 
         fun give(buffer: ByteArray) {
-            free.offer(buffer)
+            if (!closedFlag.get() && buffer !== SENTINEL) {
+                free.offer(buffer)
+            }
+        }
+
+        fun close() {
+            if (closedFlag.compareAndSet(false, true)) {
+                free.clear()
+                free.offer(SENTINEL)
+            }
+        }
+
+        private companion object {
+            val SENTINEL = ByteArray(0)
         }
     }
 
-    private abstract class Resource(val id: Int) {
+    private sealed class WriteItem {
+        class Bytes(val data: ByteArray) : WriteItem()
+        object End : WriteItem()
+    }
+
+    private abstract inner class Resource(val id: Int) {
         /** 先置位再关 socket：读线程据此知道异常是本机关闭造成的，不再上报。 */
         val closed = AtomicBoolean(false)
 
-        fun close() {
-            if (closed.compareAndSet(false, true)) closeSocket()
+        open fun close() = forceClose()
+
+        fun forceClose() {
+            if (closed.compareAndSet(false, true)) {
+                closeSocket()
+                onForceClose()
+                synchronized(lock) { allResources.remove(this) }
+            }
         }
+
+        protected open fun onForceClose() {}
 
         protected abstract fun closeSocket()
     }
 
-    private class ListenerResource(id: Int, val server: ServerSocket) : Resource(id) {
+    private inner class ListenerResource(id: Int, val server: ServerSocket) : Resource(id) {
         override fun closeSocket() = closeQuietly(server)
     }
 
-    private class ConnectionResource(id: Int, val socket: Socket, buffers: Int, size: Int) : Resource(id) {
+    private inner class ConnectionResource(
+        id: Int,
+        val channel: SessionChannel,
+        val socket: Socket,
+        buffers: Int,
+        size: Int,
+    ) : Resource(id) {
         val pool = BufferPool(buffers, size)
+        private val writeQueue = ArrayBlockingQueue<WriteItem>(MAX_QUEUED_WRITES)
+        private val writerStarted = AtomicBoolean(false)
+
+        fun enqueueWrite(bytes: ByteArray): Boolean {
+            if (closed.get()) return true
+            if (writerStarted.compareAndSet(false, true)) {
+                val writer = newThread(channel, id) { writeLoop() }
+                val keep = synchronized(lock) {
+                    val ok = !closingAll && !closed.get()
+                    if (ok) threads += writer
+                    ok
+                }
+                if (keep) writer.start() else return true
+            }
+            return writeQueue.offer(WriteItem.Bytes(bytes))
+        }
+
+        override fun close() {
+            if (abandoned || !writerStarted.get()) {
+                forceClose()
+                return
+            }
+            if (!writeQueue.offer(WriteItem.End)) forceClose()
+        }
+
+        override fun onForceClose() {
+            pool.close()
+            writeQueue.clear()
+            writeQueue.offer(WriteItem.End)
+        }
+
+        private fun writeLoop() {
+            val out = try {
+                socket.getOutputStream()
+            } catch (e: IOException) {
+                if (!closed.get()) post(Input.Failed(id, "取输出流失败：${describe(e)}"), channel)
+                forceClose()
+                return
+            }
+            var coalesceBuf: ByteArray? = null
+            while (!abandoned && !closed.get()) {
+                val item = try {
+                    writeQueue.take()
+                } catch (e: InterruptedException) {
+                    break
+                }
+                when (item) {
+                    is WriteItem.Bytes -> {
+                        if (closed.get()) break
+                        val first = item.data
+                        val next = writeQueue.peek() as? WriteItem.Bytes
+                        var payload = first
+                        var payloadLen = first.size
+                        if (next != null && first.size + next.data.size <= WRITE_COALESCE_BYTES) {
+                            val buf = coalesceBuf ?: ByteArray(WRITE_COALESCE_BYTES).also { coalesceBuf = it }
+                            System.arraycopy(first, 0, buf, 0, first.size)
+                            var filled = first.size
+                            while (true) {
+                                val peeked = writeQueue.peek() as? WriteItem.Bytes ?: break
+                                if (filled + peeked.data.size > WRITE_COALESCE_BYTES) break
+                                writeQueue.poll()
+                                System.arraycopy(peeked.data, 0, buf, filled, peeked.data.size)
+                                filled += peeked.data.size
+                            }
+                            payload = buf
+                            payloadLen = filled
+                        }
+                        try {
+                            out.write(payload, 0, payloadLen)
+                        } catch (e: IOException) {
+                            if (!closed.get()) {
+                                post(Input.Failed(id, "写 $payloadLen 字节失败：${describe(e)}"), channel)
+                            }
+                            break
+                        }
+                    }
+                    WriteItem.End -> break
+                }
+            }
+            forceClose()
+        }
+
         override fun closeSocket() = closeQuietly(socket)
     }
 
-    private class UdpResource(id: Int, val socket: DatagramSocket, buffers: Int, size: Int) : Resource(id) {
+    private inner class UdpResource(
+        id: Int,
+        val channel: SessionChannel,
+        val socket: DatagramSocket,
+        buffers: Int,
+        size: Int,
+    ) : Resource(id) {
         val pool = BufferPool(buffers, size)
+        val recvPacket = DatagramPacket(ByteArray(0), 0)
+        override fun onForceClose() = pool.close()
         override fun closeSocket() = closeQuietly(socket)
     }
 
-    private val queue = LinkedBlockingQueue<Input>()
+    private val queue = InputQueue()
 
     /** 同步动作的结果（监听开好、写失败等），在当前这批动作执行完后、处理下一个外部输入之前交给会话。只在协议线程上用。 */
     private val immediate = java.util.ArrayDeque<() -> List<SessionOutput>>()
 
     private val lock = Any()
-    private val resources = LinkedHashMap<Int, Resource>()
-    private val threads = ArrayList<Thread>()
+    private val resources = ConcurrentHashMap<Int, Resource>()
+    private val allResources = LinkedHashSet<Resource>()
+    private val threads = LinkedHashSet<Thread>()
     private var closingAll = false
     private var started = false
 
@@ -161,18 +333,19 @@ class SocketRunner(
         }
         val thread = Thread({ runLoop() }, options.threadName)
         thread.isDaemon = true
+        thread.priority = Thread.MAX_PRIORITY
         loopThread = thread
         thread.start()
     }
 
     /** 请求本机结束会话（会话按协议收尾）。不阻塞，可以从任何线程调用、重复调用。 */
     fun stop() {
-        queue.add(Input.Stop)
+        queue.add(Input.Stop, highPriority = true)
     }
 
     /** 在协议线程上执行 [task]（例如 `session.sendInput(…)`），执行它返回的动作。参数是当前单调时钟毫秒。 */
     fun submit(task: (Long) -> List<SessionOutput>) {
-        queue.add(Input.Task(task))
+        queue.add(Input.Task(task), highPriority = true)
     }
 
     /** 等协议线程结束（全部资源已关闭、全部线程已退出）。 */
@@ -183,21 +356,26 @@ class SocketRunner(
      * （卡住的写随之失败），再等一次。在协议线程上（例如事件回调里）调用时只请求结束、不等待。
      */
     override fun close() {
+        var unstarted = false
         synchronized(lock) {
             if (!started) {
                 started = true
-                terminated.countDown()
-                return
+                unstarted = true
             }
+        }
+        if (unstarted) {
+            terminated.countDown()
+            notifyTerminated()
+            return
         }
         stop()
         if (Thread.currentThread() === loopThread) return
         if (awaitTermination(options.stopGraceMillis)) return
         options.log("会话没有按时结束，强制关闭全部连接")
         abandoned = true
-        val all = synchronized(lock) { resources.values.toList() }
-        for (resource in all) resource.close()
-        queue.add(Input.Stop)
+        val all = synchronized(lock) { allResources.toList() }
+        for (resource in all) resource.forceClose()
+        queue.add(Input.Stop, highPriority = true)
         if (!awaitTermination(options.stopGraceMillis)) options.log("强制关闭后协议线程仍未结束")
     }
 
@@ -208,10 +386,26 @@ class SocketRunner(
             execute(session.start(now()))
             drainImmediate()
             while (!session.isEnded && !abandoned) {
-                val input = queue.poll(waitMillis(), TimeUnit.MILLISECONDS)
+                var input = queue.poll(waitMillis())
+                var burst = 0
+                while (input != null && !session.isEnded && !abandoned) {
+                    dispatch(input)
+                    drainImmediate()
+                    burst++
+                    if (burst >= MAX_DRAIN_BURST) {
+                        burst = 0
+                        val due = session.nextTickAtMillis
+                        if (!session.isEnded && due != null) {
+                            val currentNow = now()
+                            if (currentNow >= due) {
+                                execute(session.onTick(currentNow))
+                                drainImmediate()
+                            }
+                        }
+                    }
+                    input = queue.poll()
+                }
                 if (abandoned) break
-                if (input != null) dispatch(input)
-                drainImmediate()
                 val due = session.nextTickAtMillis
                 if (!session.isEnded && due != null) {
                     val now = now()
@@ -227,7 +421,17 @@ class SocketRunner(
         } finally {
             closeEverything()
             joinThreads()
+            forceCloseAll()
             terminated.countDown()
+            notifyTerminated()
+        }
+    }
+
+    private fun notifyTerminated() {
+        try {
+            options.onTerminated()
+        } catch (e: Exception) {
+            options.log("结束回调抛出异常（${describe(e)}），已忽略")
         }
     }
 
@@ -317,17 +521,38 @@ class SocketRunner(
 
     private fun connect(action: SessionAction.Connect) {
         val socket = Socket()
-        val connection = ConnectionResource(action.id, socket, options.buffersPerConnection, options.readBufferBytes)
+        try {
+            socket.tcpNoDelay = true
+            applySocketQos(socket, action.channel)
+            if (action.channel == SessionChannel.VIDEO && isDefaultBuffering()) {
+                socket.receiveBufferSize = VIDEO_SOCKET_RCVBUF_BYTES
+            }
+        } catch (e: IOException) {
+            // 个别平台不支持设套接字选项时照常连接。
+        }
+        val connection = ConnectionResource(
+            action.id,
+            action.channel,
+            socket,
+            buffersFor(action.channel),
+            bufferSizeFor(action.channel),
+        )
         val thread = newThread(action.channel, action.id) {
             try {
                 socket.connect(InetSocketAddress(InetAddress.getByName(action.host), action.port), options.connectTimeoutMillis)
+                try {
+                    socket.tcpNoDelay = true
+                    applySocketQos(socket, action.channel)
+                } catch (e: IOException) {
+                    // 同上。
+                }
             } catch (e: IOException) {
                 if (!connection.closed.get()) {
-                    post(Input.Failed(action.id, "连接 ${action.host}:${action.port} 失败：${describe(e)}"))
+                    post(Input.Failed(action.id, "连接 ${action.host}:${action.port} 失败：${describe(e)}"), action.channel)
                 }
                 return@newThread
             }
-            post(Input.Connected(action.id))
+            post(Input.Connected(action.id), action.channel)
             readLoop(connection)
         }
         if (!register(connection, thread)) {
@@ -339,13 +564,10 @@ class SocketRunner(
 
     private fun write(action: SessionAction.Write) {
         val connection = lookup(action.id) as? ConnectionResource ?: return
-        try {
-            connection.socket.getOutputStream().write(action.bytes)
-        } catch (e: IOException) {
-            if (!connection.closed.get()) {
-                val message = "写 ${action.bytes.size} 字节失败：${describe(e)}"
-                immediate.add { session.onIoError(action.id, message, now()) }
-            }
+        if (!connection.enqueueWrite(action.bytes)) {
+            connection.forceClose()
+            val message = "写 ${action.bytes.size} 字节失败：发送队列已满"
+            immediate.add { session.onIoError(action.id, message, now()) }
         }
     }
 
@@ -353,6 +575,7 @@ class SocketRunner(
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket(InetSocketAddress(InetAddress.getByName(action.localHost), 0))
+            applyDatagramQos(socket, action.channel)
             socket.connect(InetSocketAddress(InetAddress.getByName(action.remoteHost), action.remotePort))
         } catch (e: IOException) {
             socket?.let { closeQuietly(it) }
@@ -360,7 +583,7 @@ class SocketRunner(
             immediate.add { session.onIoError(action.id, message, now()) }
             return
         }
-        val udp = UdpResource(action.id, socket, options.buffersPerConnection, options.readBufferBytes)
+        val udp = UdpResource(action.id, action.channel, socket, buffersFor(action.channel), udpBufferSizeFor(action.channel))
         val thread = newThread(action.channel, action.id) { udpLoop(udp) }
         if (!register(udp, thread)) {
             closeQuietly(socket)
@@ -373,12 +596,13 @@ class SocketRunner(
         val socket: DatagramSocket
         try {
             socket = DatagramSocket(InetSocketAddress(InetAddress.getByName(action.localHost), action.localPort))
+            applyDatagramQos(socket, action.channel)
         } catch (e: IOException) {
             val message = "绑 UDP（${action.localHost}:${action.localPort}）失败：${describe(e)}"
             immediate.add { session.onIoError(action.id, message, now()) }
             return
         }
-        val udp = UdpResource(action.id, socket, options.buffersPerConnection, options.readBufferBytes)
+        val udp = UdpResource(action.id, action.channel, socket, buffersFor(action.channel), udpBufferSizeFor(action.channel))
         val thread = newThread(action.channel, action.id) { udpLoop(udp) }
         if (!register(udp, thread)) {
             closeQuietly(socket)
@@ -402,17 +626,28 @@ class SocketRunner(
     }
 
     private fun closeResource(id: Int) {
-        val resource = synchronized(lock) { resources.remove(id) } ?: return
+        val resource = resources.remove(id) ?: return
         resource.close()
     }
 
     /** 协议线程退出前：把还没关的资源按创建的反序关掉，之后不再接受新资源。 */
     private fun closeEverything() {
+        val force = abandoned || failure != null
         val remaining = synchronized(lock) {
             closingAll = true
             resources.values.toList().also { resources.clear() }
         }
-        for (resource in remaining.asReversed()) resource.close()
+        for (resource in remaining.asReversed()) {
+            if (force) resource.forceClose() else resource.close()
+        }
+    }
+
+    /** 线程等待结束后的兜底强关，防止对端卡死写队列导致套接字残留。 */
+    private fun forceCloseAll() {
+        val all = synchronized(lock) {
+            allResources.toList().also { allResources.clear() }
+        }
+        for (resource in all.asReversed()) resource.forceClose()
     }
 
     private fun joinThreads() {
@@ -448,10 +683,22 @@ class SocketRunner(
                 closeQuietly(candidate)
             }
         } catch (e: IOException) {
-            if (!listener.closed.get()) post(Input.Failed(action.id, "${action.channel.label}监听出错：${describe(e)}"))
+            if (!listener.closed.get()) post(Input.Failed(action.id, "${action.channel.label}监听出错：${describe(e)}"), action.channel)
             return
         }
-        val connection = ConnectionResource(action.acceptId, socket, options.buffersPerConnection, options.readBufferBytes)
+        try {
+            socket.tcpNoDelay = true
+            applySocketQos(socket, action.channel)
+        } catch (e: IOException) {
+            // 个别平台不支持设套接字选项时照常继续。
+        }
+        val connection = ConnectionResource(
+            action.acceptId,
+            action.channel,
+            socket,
+            buffersFor(action.channel),
+            bufferSizeFor(action.channel),
+        )
         if (!register(connection, null)) {
             closeQuietly(socket)
             return
@@ -459,12 +706,13 @@ class SocketRunner(
         rejectExtraConnections(listener, action)
         val address = socket.inetAddress
         val remote = (address as? Inet4Address)?.hostAddress ?: address?.hostAddress ?: ""
-        post(Input.Accepted(action.acceptId, remote))
+        post(Input.Accepted(action.acceptId, remote), action.channel)
         readLoop(connection)
     }
 
     /** 这个监听已经接受过一条连接：另起线程，之后再连进来的接受后立刻关掉（前 [MAX_REJECT_LOGS] 条记日志），直到监听关闭。 */
     private fun rejectExtraConnections(listener: ListenerResource, action: SessionAction.Listen) {
+        if (listener.closed.get()) return
         val thread = newThread(action.channel, action.id) {
             var rejected = 0
             while (true) {
@@ -485,8 +733,9 @@ class SocketRunner(
             }
         }
         val keep = synchronized(lock) {
-            if (!closingAll) threads += thread
-            !closingAll
+            val ok = !closingAll && !listener.closed.get()
+            if (ok) threads += thread
+            ok
         }
         if (keep) thread.start()
     }
@@ -495,7 +744,7 @@ class SocketRunner(
         val input = try {
             connection.socket.getInputStream()
         } catch (e: IOException) {
-            if (!connection.closed.get()) post(Input.Failed(connection.id, "取输入流失败：${describe(e)}"))
+            if (!connection.closed.get()) post(Input.Failed(connection.id, "取输入流失败：${describe(e)}"), connection.channel)
             return
         }
         while (true) {
@@ -504,65 +753,146 @@ class SocketRunner(
                 input.read(buffer)
             } catch (e: IOException) {
                 connection.pool.give(buffer)
-                if (!connection.closed.get()) post(Input.Failed(connection.id, "读失败：${describe(e)}"))
+                if (!connection.closed.get()) post(Input.Failed(connection.id, "读失败：${describe(e)}"), connection.channel)
                 return
             }
             if (n < 0) {
                 connection.pool.give(buffer)
-                if (!connection.closed.get()) post(Input.Closed(connection.id))
+                if (!connection.closed.get()) post(Input.Closed(connection.id), connection.channel)
                 return
             }
             if (n == 0) {
                 connection.pool.give(buffer)
                 continue
             }
-            post(Input.Data(connection.id, buffer, n, connection.pool))
+            post(Input.Data(connection.id, buffer, n, connection.pool), connection.channel)
         }
     }
 
     private fun udpLoop(udp: UdpResource) {
+        val packet = udp.recvPacket
         while (true) {
             val buffer = udp.pool.take(udp.closed) ?: return
-            val packet = DatagramPacket(buffer, buffer.size)
+            packet.setData(buffer, 0, buffer.size)
             try {
                 udp.socket.receive(packet)
             } catch (e: IOException) {
                 udp.pool.give(buffer)
-                if (!udp.closed.get()) post(Input.Failed(udp.id, "收 UDP 失败：${describe(e)}"))
+                if (!udp.closed.get()) post(Input.Failed(udp.id, "收 UDP 失败：${describe(e)}"), udp.channel)
                 return
             }
-            post(Input.Datagram(udp.id, buffer, packet.length, udp.pool))
+            post(Input.Datagram(udp.id, buffer, packet.length, udp.pool), udp.channel)
         }
     }
 
     // ---------------- 工具 ----------------
 
-    private fun post(input: Input) {
-        queue.add(input)
+    private fun isDefaultBuffering(): Boolean =
+        options.readBufferBytes == DEFAULT_READ_BUFFER_BYTES && options.buffersPerConnection == DEFAULT_BUFFERS_PER_CONN
+
+    private fun buffersFor(channel: SessionChannel): Int {
+        if (!isDefaultBuffering()) return options.buffersPerConnection
+        return when (channel) {
+            SessionChannel.VIDEO -> 8
+            SessionChannel.AUDIO -> 8
+            SessionChannel.REMOTE_CONTROL, SessionChannel.MIC -> 1
+            else -> 2
+        }
     }
 
-    private fun lookup(id: Int): Resource? = synchronized(lock) { resources[id] }
+    private fun bufferSizeFor(channel: SessionChannel): Int {
+        if (!isDefaultBuffering()) return options.readBufferBytes
+        return when (channel) {
+            SessionChannel.VIDEO -> DEFAULT_READ_BUFFER_BYTES
+            SessionChannel.AUDIO -> 16 * 1024
+            SessionChannel.REMOTE_CONTROL, SessionChannel.MIC -> 4 * 1024
+            else -> 16 * 1024
+        }
+    }
+
+    private fun udpBufferSizeFor(channel: SessionChannel): Int {
+        if (!isDefaultBuffering()) return options.readBufferBytes
+        return when (channel) {
+            SessionChannel.KEEPALIVE -> 1024
+            else -> DEFAULT_READ_BUFFER_BYTES
+        }
+    }
+
+    private fun applySocketQos(socket: Socket, channel: SessionChannel) {
+        try {
+            socket.trafficClass = trafficClassFor(channel)
+        } catch (_: IOException) {
+            // 忽略不支持 TOS / DSCP 的内核或协议栈。
+        } catch (_: IllegalArgumentException) {
+            // 忽略不支持 TOS 的平台。
+        }
+    }
+
+    private fun applyDatagramQos(socket: DatagramSocket, channel: SessionChannel) {
+        try {
+            socket.trafficClass = trafficClassFor(channel)
+        } catch (_: IOException) {
+            // 忽略不支持 TOS / DSCP 的内核或协议栈。
+        } catch (_: IllegalArgumentException) {
+            // 忽略不支持 TOS 的平台。
+        }
+    }
+
+    private fun trafficClassFor(channel: SessionChannel): Int = when (channel) {
+        SessionChannel.AUDIO,
+        SessionChannel.REMOTE_CONTROL,
+        SessionChannel.CONTROL,
+        SessionChannel.DMSDP_CONTROL,
+        SessionChannel.HISIGHT_CONTROL,
+        SessionChannel.KEEPALIVE,
+        -> TOS_VOICE_EXPEDITED
+        SessionChannel.VIDEO -> TOS_VIDEO_AF41
+        else -> TOS_LOW_DELAY
+    }
+
+    private fun post(input: Input, channel: SessionChannel) {
+        queue.add(input, highPriority = channel != SessionChannel.VIDEO)
+    }
+
+    private fun lookup(id: Int): Resource? = resources[id]
 
     /** 登记资源和它的线程；协议线程已经在退出时返回 false，调用方自己关掉 socket。 */
     private fun register(resource: Resource, thread: Thread?): Boolean = synchronized(lock) {
         if (closingAll) return false
         resources[resource.id] = resource
+        allResources += resource
         if (thread != null) threads += thread
         true
     }
 
     private fun newThread(channel: SessionChannel, id: Int, body: () -> Unit): Thread {
-        val thread = Thread(body, "${options.threadName}-${channel.name.lowercase()}-$id")
+        val thread = Thread(
+            {
+                try {
+                    body()
+                } finally {
+                    synchronized(lock) { threads.remove(Thread.currentThread()) }
+                }
+            },
+            "${options.threadName}-${channel.name.lowercase()}-$id",
+        )
         thread.isDaemon = true
         return thread
     }
 
     private companion object {
+        const val DEFAULT_READ_BUFFER_BYTES = 64 * 1024
+        const val DEFAULT_BUFFERS_PER_CONN = 2
+        const val VIDEO_SOCKET_RCVBUF_BYTES = 512 * 1024
+        const val MAX_QUEUED_WRITES = 128
+        const val WRITE_COALESCE_BYTES = 8 * 1024
+        const val MAX_DRAIN_BURST = 16
+        const val TOS_VOICE_EXPEDITED = 0xB8
+        const val TOS_VIDEO_AF41 = 0x88
+        const val TOS_LOW_DELAY = 0x10
+
         /** 没有定时任务时协议线程最长等多久再看一眼。 */
         const val IDLE_WAIT_MILLIS = 1_000L
-
-        /** 读线程等空闲缓冲时，每隔多久检查一次资源是否已关闭。 */
-        const val POOL_WAIT_MILLIS = 200L
 
         /** 一个监听上被关掉的多余连接，最多记几条日志。 */
         const val MAX_REJECT_LOGS = 3

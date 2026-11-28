@@ -23,9 +23,12 @@ class MicAacEncoder(
         fun onFrame(frame: ByteArray)
     }
 
+    private val lock = Any()
     private val codec: MediaCodec = MediaCodec.createEncoderByType(MIME)
     private val info = MediaCodec.BufferInfo()
     private var presentationUs = 0L
+
+    @Volatile
     private var closed = false
 
     /** 送进编码器的块数、因输入队列满丢掉的块数、交出的帧数。 */
@@ -55,24 +58,26 @@ class MicAacEncoder(
 
     /** 送一块 16 位小端交错 PCM（`pcm[0, length)`），顺带取出已经编好的帧。 */
     fun encode(pcm: ByteArray, length: Int) {
-        if (closed) return
-        val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
-        if (index >= 0) {
-            val buffer = codec.getInputBuffer(index)
-            if (buffer == null) {
-                dropped++
+        synchronized(lock) {
+            if (closed) return
+            val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+            if (index >= 0) {
+                val buffer = codec.getInputBuffer(index)
+                if (buffer == null) {
+                    dropped++
+                } else {
+                    buffer.clear()
+                    val n = minOf(length, buffer.remaining())
+                    buffer.put(pcm, 0, n)
+                    codec.queueInputBuffer(index, 0, n, presentationUs, 0)
+                    presentationUs += n.toLong() / (channels * 2) * 1_000_000L / sampleRate
+                    chunks++
+                }
             } else {
-                buffer.clear()
-                val n = minOf(length, buffer.remaining())
-                buffer.put(pcm, 0, n)
-                codec.queueInputBuffer(index, 0, n, presentationUs, 0)
-                presentationUs += n.toLong() / (channels * 2) * 1_000_000L / sampleRate
-                chunks++
+                dropped++
             }
-        } else {
-            dropped++
+            drain()
         }
-        drain()
     }
 
     private fun drain() {
@@ -96,14 +101,16 @@ class MicAacEncoder(
     }
 
     override fun close() {
-        if (closed) return
-        closed = true
-        try {
-            codec.stop()
-        } catch (e: IllegalStateException) {
-            // 已经出错停了。
+        synchronized(lock) {
+            if (closed) return
+            closed = true
+            try {
+                codec.stop()
+            } catch (e: IllegalStateException) {
+                // 已经出错停了。
+            }
+            codec.release()
         }
-        codec.release()
     }
 
     override fun toString() = "MicAacEncoder(${sampleRate}Hz/${channels}声道，${bitrate / 1000}kbps)"

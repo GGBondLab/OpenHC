@@ -23,24 +23,40 @@ import io.github.gcbond.openhc.platform.log.Log
 class BootStartReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (!BootStartPolicy.isBootBroadcast(intent.action)) return
+        val now = SystemClock.elapsedRealtime()
+        val duplicate = synchronized(DEDUPE_LOCK) {
+            if (BootStartPolicy.isDuplicateBoot(lastHandledElapsedMs, now)) {
+                true
+            } else {
+                lastHandledElapsedMs = now
+                false
+            }
+        }
+        if (duplicate) {
+            Log.i(BootStart.TAG, "收到重复开机广播（${intent.action}），跳过")
+            return
+        }
         val app = context.applicationContext
         // 熄火不一定结束进程：点火时也补一次「暂停车机 WiFi 扫描」的恢复、自动打开的车机热点的关闭。
-        (app as? OpenHcApp)?.scanPause?.recover("开机或点火")
-        (app as? OpenHcApp)?.carHotspotAuto?.recover("开机或点火")
+        (app as? OpenHcApp)?.recoverAdbSwitchesIfNeeded("开机或点火")
         if (app is OpenHcApp && BootStart.isSilent(app)) {
             SilentBootWatch(app, goAsync()).start()
         } else {
             BootLaunchWatch(app, goAsync()).start()
         }
     }
+
+    private companion object {
+        val DEDUPE_LOCK = Any()
+        var lastHandledElapsedMs = -1L
+    }
 }
 
 /**
- * 打开界面并看它在不在前台：[BootStartPolicy.CHECK_DELAY_MS] 后不在（没出来，或者出来后被盖住了）就再开一次，
- * 再过同样久按那时的情况记下结果。全在主线程上。
+ * 打开界面并看它在不在前台：[BootStartPolicy.CHECK_DELAY_MS] 后不在（没出来，或者出来后被车机桌面盖住了）
+ * 就再次拉到前台，最多补开 [BootStartPolicy.MAX_COVERED_RETRIES] 次。全在主线程上。
  *
- * 开机广播是逐个接收器排队送的，占着它后面的应用都得等：界面一到前台（进程已在前台，不会被收掉）就先放手，
- * 看门狗接着靠主线程的定时器跑完；界面一直没出来才占满两轮，让进程活到补开那一下。
+ * 开机广播超过约 10 秒会被系统判超时，因此界面一到前台或第一次补开后即放手 [pending]，后续重拉在进程内完成。
  */
 internal class BootLaunchWatch(
     private val app: Context,
@@ -54,7 +70,7 @@ internal class BootLaunchWatch(
     private val installStamp = BootStart.installedAtMillis(app)
     private var inFront = false
     private var everShown = false
-    private var retried = false
+    private var retries = 0
     private var released = false
     private var done = false
 
@@ -65,15 +81,16 @@ internal class BootLaunchWatch(
         // 先记一笔：进程之后被收掉的话，设置页至少知道开机广播送到了。
         record(BootOutcome.PENDING)
         application?.registerActivityLifecycleCallbacks(this)
-        if (!open()) {
+        if (!open(resurfaceOnly = false)) {
             finish(BootOutcome.FAILED)
             return
         }
         handler.postDelayed(::check, BootStartPolicy.CHECK_DELAY_MS)
     }
 
-    private fun open(): Boolean = try {
-        app.startActivity(BootStart.launchIntent(app))
+    private fun open(resurfaceOnly: Boolean): Boolean = try {
+        val intent = if (resurfaceOnly) BootStart.surfaceIntent(app) else BootStart.launchIntent(app)
+        app.startActivity(intent)
         true
     } catch (e: RuntimeException) {
         Log.e(BootStart.TAG, "打开界面失败", e)
@@ -82,10 +99,12 @@ internal class BootLaunchWatch(
 
     private fun check() {
         if (done) return
-        if (BootStartPolicy.shouldRetry(inFront, retried)) {
-            retried = true
-            Log.w(BootStart.TAG, "界面不在前台（${if (everShown) "打开过、被盖住了" else "没出来"}），再开一次")
-            open()
+        if (BootStartPolicy.shouldRetryAttempt(inFront, retries)) {
+            retries++
+            Log.w(BootStart.TAG, "界面不在前台（${if (everShown) "打开过、被盖住了" else "没出来"}），第 $retries 次补开")
+            open(resurfaceOnly = everShown)
+            // 先放行系统广播，避免多次补开累计超过 BroadcastReceiver 超时阈值。
+            releaseBroadcast()
             handler.postDelayed(::check, BootStartPolicy.CHECK_DELAY_MS)
             return
         }

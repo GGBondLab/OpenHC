@@ -54,22 +54,47 @@ object AacConfig {
             audioSpecificConfig(sampleRate, if (channelConfig == 0) 2 else channelConfig, objectType)
     }
 
+    /** 播放线程复用的可变 ADTS 解析结果，避免每包分配 [Adts]。 */
+    internal class AdtsScratch {
+        var objectType: Int = OBJECT_TYPE_LC
+        var sampleRateIndex: Int = 3
+        var channelConfig: Int = 2
+        var frameLength: Int = 0
+        var headerLength: Int = 0
+
+        val sampleRate: Int get() = SAMPLE_RATES[sampleRateIndex]
+
+        fun audioSpecificConfig(): ByteArray =
+            audioSpecificConfig(sampleRate, if (channelConfig == 0) 2 else channelConfig, objectType)
+    }
+
     /**
      * 解析 `data[offset, offset + length)` 开头的 ADTS 头；不是 ADTS、或声明的帧长不在 [头长, length] 之内返回 null。
      */
     fun parseAdts(data: ByteArray, offset: Int, length: Int): Adts? {
+        val scratch = AdtsScratch()
+        if (!parseAdtsInto(data, offset, length, scratch)) return null
+        return Adts(scratch.objectType, scratch.sampleRateIndex, scratch.channelConfig, scratch.frameLength, scratch.headerLength)
+    }
+
+    internal fun parseAdtsInto(data: ByteArray, offset: Int, length: Int, out: AdtsScratch): Boolean {
         require(offset >= 0 && length >= 0 && offset <= data.size - length) { "范围非法" }
-        if (length < ADTS_HEADER) return null
+        if (length < ADTS_HEADER) return false
         fun u8(i: Int) = data[offset + i].toInt() and 0xFF
-        if (u8(0) != 0xFF || u8(1) and 0xF6 != 0xF0) return null
+        if (u8(0) != 0xFF || u8(1) and 0xF6 != 0xF0) return false
         val headerLength = if (u8(1) and 0x01 != 0) ADTS_HEADER else ADTS_HEADER_CRC
         val objectType = (u8(2) ushr 6) + 1
         val sampleRateIndex = (u8(2) ushr 2) and 0x0F
-        if (sampleRateIndex >= SAMPLE_RATES.size) return null
+        if (sampleRateIndex >= SAMPLE_RATES.size) return false
         val channelConfig = ((u8(2) and 0x01) shl 2) or (u8(3) ushr 6)
         val frameLength = ((u8(3) and 0x03) shl 11) or (u8(4) shl 3) or (u8(5) ushr 5)
-        if (frameLength < headerLength || frameLength > length) return null
-        return Adts(objectType, sampleRateIndex, channelConfig, frameLength, headerLength)
+        if (frameLength < headerLength || frameLength > length) return false
+        out.objectType = objectType
+        out.sampleRateIndex = sampleRateIndex
+        out.channelConfig = channelConfig
+        out.frameLength = frameLength
+        out.headerLength = headerLength
+        return true
     }
 
     private const val ESCAPE_INDEX = 15

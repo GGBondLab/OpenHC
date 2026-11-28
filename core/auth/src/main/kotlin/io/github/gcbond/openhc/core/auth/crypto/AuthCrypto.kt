@@ -129,6 +129,12 @@ internal object Modp {
         return toFixedLength(result, length)
     }
 
+    /** base^(2 * exponent) mod p，合并 SPEKE 生成元平方与幂运算为单次模幂。 */
+    fun modPowTwiceExponent(base: ByteArray, exponent: ByteArray, length: Int): ByteArray {
+        val result = BigInteger(1, base).modPow(BigInteger(1, exponent).shiftLeft(1), prime(length))
+        return toFixedLength(result, length)
+    }
+
     /** 1 < value < p - 1，按无符号大端解释。 */
     fun isValidPublicValue(value: ByteArray, length: Int): Boolean {
         if (value.size > length) return false
@@ -166,6 +172,15 @@ internal object Ed25519Keys {
         return signature
     }
 
+    fun sign(seed: ByteArray, publicKey: ByteArray, message: ByteArray): ByteArray {
+        require(seed.size == KEY_LENGTH && publicKey.size == KEY_LENGTH) { "Ed25519 种子与公钥必须是 32 字节" }
+        val signature = ByteArray(SIGNATURE_LENGTH)
+        Ed25519.sign(seed, 0, publicKey, 0, message, 0, message.size, signature, 0)
+        return signature
+    }
+
+    fun warmUp() = Ed25519.precompute()
+
     fun verify(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {
         if (publicKey.size != KEY_LENGTH || signature.size != SIGNATURE_LENGTH) return false
         return try {
@@ -179,6 +194,8 @@ internal object Ed25519Keys {
 /** X25519（RFC 7748）。私钥是 32 字节原始值，钳位在标量乘法里做。 */
 internal object X25519Keys {
     const val KEY_LENGTH = 32
+
+    fun warmUp() = X25519.precompute()
 
     fun publicKey(privateKey: ByteArray): ByteArray {
         require(privateKey.size == KEY_LENGTH) { "X25519 私钥必须是 32 字节" }

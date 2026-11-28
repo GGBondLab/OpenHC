@@ -12,6 +12,8 @@ class BootStartPolicyTest {
     @Test
     fun onlyTheBootCompletedBroadcastCounts() {
         assertTrue(BootStartPolicy.isBootBroadcast("android.intent.action.BOOT_COMPLETED"))
+        assertTrue(BootStartPolicy.isBootBroadcast("android.intent.action.QUICKBOOT_POWERON"))
+        assertTrue(BootStartPolicy.isBootBroadcast("com.htc.intent.action.QUICKBOOT_POWERON"))
         for (other in listOf(
             null,
             "",
@@ -22,6 +24,13 @@ class BootStartPolicyTest {
         )) {
             assertFalse(BootStartPolicy.isBootBroadcast(other), "$other")
         }
+    }
+
+    @Test
+    fun duplicateQuickbootAndBootCompletedWithinWindowAreIgnored() {
+        assertFalse(BootStartPolicy.isDuplicateBoot(-1L, 5_000L))
+        assertTrue(BootStartPolicy.isDuplicateBoot(5_000L, 9_000L))
+        assertFalse(BootStartPolicy.isDuplicateBoot(5_000L, 5_000L + BootStartPolicy.BOOT_DEDUPE_WINDOW_MS))
     }
 
     @Test
@@ -65,6 +74,14 @@ class BootStartPolicyTest {
         assertTrue(BootStartPolicy.shouldRetry(inFront = false, retried = false), "没出来，或者出来后被盖住了")
         assertFalse(BootStartPolicy.shouldRetry(inFront = false, retried = true), "只补开一次")
         assertFalse(BootStartPolicy.shouldRetry(inFront = true, retried = false))
+    }
+
+    @Test
+    fun reopensUpToMaxRetriesWhenCoveredByLauncher() {
+        assertTrue(BootStartPolicy.shouldRetryAttempt(inFront = false, retries = 0))
+        assertTrue(BootStartPolicy.shouldRetryAttempt(inFront = false, retries = BootStartPolicy.MAX_COVERED_RETRIES - 1))
+        assertFalse(BootStartPolicy.shouldRetryAttempt(inFront = false, retries = BootStartPolicy.MAX_COVERED_RETRIES))
+        assertFalse(BootStartPolicy.shouldRetryAttempt(inFront = true, retries = 0))
     }
 
     @Test

@@ -24,10 +24,32 @@ internal object DiagnosticsReport {
      * 导出前逐行处理：完整的蓝牙 / 网卡地址只留首尾几位（和 OpenHC 自己打日志时的写法一样）。OpenHC 自己本来就不打完整地址，
      * 这里兜住系统在本进程里打的日志（各家车机系统打什么不一定）。占位地址（全 0、02:00:00:00:00:00、全 f）不认人，原样留着。
      */
-    fun redact(line: String): String = MAC.replace(line) { m ->
-        val mac = m.value
-        if (mac.lowercase() in KEEP) mac else mac.substring(0, 2) + ":**:**:**:" + mac.substring(12)
+    fun redact(line: String): String {
+        if (!hasPotentialMac(line)) return line
+        return MAC.replace(line) { m ->
+            val mac = m.value
+            if (mac.lowercase(Locale.ROOT) in KEEP) mac else mac.substring(0, 2) + ":**:**:**:" + mac.substring(12)
+        }
     }
+
+    /** 快速扫描是否存在 `XX:XX:XX:XX:XX:XX` 形态的冒号组，普通无地址日志直接跳过带双负向回顾的正则匹配。 */
+    private fun hasPotentialMac(line: String): Boolean {
+        val limit = line.length - 14
+        var c = 2
+        while (c < limit) {
+            val idx = line.indexOf(':', c)
+            if (idx < 0 || idx >= limit) return false
+            if (line[idx + 3] == ':' && line[idx + 6] == ':' && line[idx + 9] == ':' && line[idx + 12] == ':' &&
+                isHex(line[idx - 2]) && isHex(line[idx - 1]) && isHex(line[idx + 1])
+            ) {
+                return true
+            }
+            c = idx + 1
+        }
+        return false
+    }
+
+    private fun isHex(ch: Char): Boolean = ch in '0'..'9' || ch in 'a'..'f' || ch in 'A'..'F'
 
     /**
      * 这一行（`logcat -v threadtime` 格式）是不是 [pid] 这个进程打的。不是日志行的（例如「--------- beginning of main」）算是。
@@ -43,9 +65,32 @@ internal object DiagnosticsReport {
      * [time] 形如 `01-02 03:04:05.678`；[priority] 是安卓日志级别（2 VERBOSE ～ 7 ASSERT）。
      */
     fun ownLines(time: String, pid: Int, tid: Int, priority: Int, tag: String, message: String, stack: String?): List<String> {
-        val prefix = String.format(Locale.US, "%s %5d %5d %c %s: ", time, pid, tid, levelChar(priority), tag)
+        val level = levelChar(priority)
+        if (stack.isNullOrBlank() && message.indexOf('\n') < 0 && message.indexOf('\r') < 0) {
+            val sb = StringBuilder(time.length + tag.length + message.length + 18)
+            appendPrefix(sb, time, pid, tid, level, tag)
+            sb.append(message)
+            return java.util.Collections.singletonList(sb.toString())
+        }
+        val prefixBuilder = StringBuilder(time.length + tag.length + 18)
+        appendPrefix(prefixBuilder, time, pid, tid, level, tag)
+        val prefix = prefixBuilder.toString()
         val text = if (stack.isNullOrBlank()) message else message + "\n" + stack.trimEnd()
         return text.split('\n').map { prefix + it.removeSuffix("\r") }
+    }
+
+    private fun appendPrefix(sb: StringBuilder, time: String, pid: Int, tid: Int, level: Char, tag: String) {
+        sb.append(time).append(' ')
+        appendPadded5(sb, pid)
+        sb.append(' ')
+        appendPadded5(sb, tid)
+        sb.append(' ').append(level).append(' ').append(tag).append(": ")
+    }
+
+    private fun appendPadded5(sb: StringBuilder, value: Int) {
+        val s = value.toString()
+        for (i in s.length until 5) sb.append(' ')
+        sb.append(s)
     }
 
     /**
@@ -54,10 +99,67 @@ internal object DiagnosticsReport {
      * 自己打的，照记。
      */
     fun writtenDirectly(line: String): Boolean {
-        val m = THREADTIME_TAG.find(line) ?: return false
-        val tag = m.groupValues[1]
-        if (tag != OWN_TAG && !tag.startsWith("$OWN_TAG-")) return false
-        return !m.groupValues[2].startsWith("type=1400")
+        val levelIdx = threadtimeLevelIndex(line)
+        if (levelIdx < 0) return false
+        val level = line[levelIdx]
+        if ("VDIWEFAS".indexOf(level) < 0) return false
+        val tagStart = levelIdx + 2
+        val colon = line.indexOf(':', tagStart)
+        if (colon <= tagStart) return false
+        var tagEnd = colon
+        while (tagEnd > tagStart && line[tagEnd - 1] == ' ') tagEnd--
+        val tagLen = tagEnd - tagStart
+        val ownLen = OWN_TAG.length
+        if (tagLen < ownLen || !line.regionMatches(tagStart, OWN_TAG, 0, ownLen)) return false
+        if (tagLen > ownLen && line[tagStart + ownLen] != '-') return false
+        var msgStart = colon + 1
+        if (msgStart < line.length && line[msgStart] == ' ') msgStart++
+        return !line.startsWith("type=1400", msgStart)
+    }
+
+    /** 实时日志框里一行的视觉分类：普通行、警告/错误行（W/E/F/A）、诊断分节标记行（===== … =====）。 */
+    enum class LineKind { NORMAL, WARN, MARKER }
+
+    /**
+     * 判断一行运行日志的类型（供设置页实时日志框着色和「只看异常」筛选）：
+     * - `===== … =====` 诊断记录标记行算 [LineKind.MARKER]（其中写明丢日志或退出的算 [LineKind.WARN]）；
+     * - `logcat -v threadtime` 行中级别为 `W`/`E`/`F`/`A` 算 [LineKind.WARN]；
+     * - 其余行算 [LineKind.NORMAL]。
+     */
+    fun classifyLine(line: String): LineKind {
+        if (line.startsWith("===== ") && line.endsWith(" =====")) {
+            return if ("丢了" in line || "退出了" in line) LineKind.WARN else LineKind.MARKER
+        }
+        val idx = threadtimeLevelIndex(line)
+        return if (idx >= 0) {
+            when (line[idx]) {
+                'W', 'E', 'F', 'A' -> LineKind.WARN
+                else -> LineKind.NORMAL
+            }
+        } else {
+            LineKind.NORMAL
+        }
+    }
+
+    /** 快速定位 `MM-dd HH:mm:ss.SSS  PID  TID L …` 里级别字符的下标，不匹配返回 -1，不分配正则对象。 */
+    private fun threadtimeLevelIndex(line: String): Int {
+        val n = line.length
+        if (n < 22 || line[2] != '-' || line[5] != ' ' || line[8] != ':' || line[11] != ':' || line[14] != '.') {
+            return -1
+        }
+        var i = 15
+        if (i >= n || line[i] !in '0'..'9') return -1
+        while (i < n && line[i] in '0'..'9') i++
+        if (i >= n || line[i] != ' ') return -1
+        while (i < n && line[i] == ' ') i++
+        if (i >= n || line[i] !in '0'..'9') return -1
+        while (i < n && line[i] in '0'..'9') i++
+        if (i >= n || line[i] != ' ') return -1
+        while (i < n && line[i] == ' ') i++
+        if (i >= n || line[i] !in '0'..'9') return -1
+        while (i < n && line[i] in '0'..'9') i++
+        if (i + 2 >= n || line[i] != ' ' || line[i + 2] != ' ') return -1
+        return i + 1
     }
 
     private fun levelChar(priority: Int): Char = when (priority) {
@@ -73,9 +175,6 @@ internal object DiagnosticsReport {
     private const val OWN_TAG = "OpenHC"
 
     private val THREADTIME_PID = Regex("^\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d+\\s+(\\d+)\\s+\\d+\\s")
-
-    /** threadtime 行里的标签和消息；短标签 logcat 会在冒号前补空格。 */
-    private val THREADTIME_TAG = Regex("^\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d+\\s+\\d+\\s+\\d+ [VDIWEFAS] (.+?)\\s*: ?(.*)$")
 
     /** 冒号分隔的 6 段地址；前后紧挨着别的十六进制段的不算（例如更长的 IPv6 地址）。 */
     private val MAC = Regex("(?<![0-9A-Fa-f])(?<![0-9A-Fa-f]:)[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}(?!:?[0-9A-Fa-f])")

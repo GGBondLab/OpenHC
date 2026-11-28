@@ -92,7 +92,12 @@ class BleBeacon(
             null
         }
         if (le == null) return fail("系统没有提供广播接口（蓝牙没开，或车机不支持 BLE 广播）", permanent = false)
-        synchronized(lock) { advertiser = le }
+        val shouldStart = synchronized(lock) {
+            advertiser = le
+            if (state == State.STOP_PENDING) state = State.STOPPED
+            state == State.STARTING
+        }
+        if (!shouldStart) return
         val settings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)

@@ -35,19 +35,30 @@ class ByteWriter(initialCapacity: Int = 64) {
     fun u32Be(value: Long): ByteWriter {
         require(value in 0..0xFFFF_FFFFL) { "u32 越界: $value" }
         ensure(4)
-        for (shift in intArrayOf(24, 16, 8, 0)) buf[size++] = (value ushr shift).toByte()
+        buf[size++] = (value ushr 24).toByte()
+        buf[size++] = (value ushr 16).toByte()
+        buf[size++] = (value ushr 8).toByte()
+        buf[size++] = value.toByte()
         return this
     }
 
     fun u32Le(value: Long): ByteWriter {
         require(value in 0..0xFFFF_FFFFL) { "u32 越界: $value" }
         ensure(4)
-        for (shift in intArrayOf(0, 8, 16, 24)) buf[size++] = (value ushr shift).toByte()
+        buf[size++] = value.toByte()
+        buf[size++] = (value ushr 8).toByte()
+        buf[size++] = (value ushr 16).toByte()
+        buf[size++] = (value ushr 24).toByte()
         return this
     }
 
     /** 写一个 EA 变长整数（最短形式，格式见 [Ea]）。超出 0..[Ea.MAX_VALUE] 抛 [IllegalArgumentException]。 */
-    fun ea(value: Int): ByteWriter = bytes(Ea.encode(value))
+    fun ea(value: Int): ByteWriter {
+        val len = Ea.encodedSize(value)
+        ensure(len)
+        size += Ea.encodeInto(value, buf, size)
+        return this
+    }
 
     fun bytes(data: ByteArray, offset: Int = 0, length: Int = data.size - offset): ByteWriter {
         require(offset >= 0 && length >= 0 && offset + length <= data.size) { "范围非法" }
@@ -60,9 +71,12 @@ class ByteWriter(initialCapacity: Int = 64) {
     fun toByteArray(): ByteArray = buf.copyOf(size)
 
     private fun ensure(extra: Int) {
-        if (size + extra <= buf.size) return
+        val needed = size + extra
+        if (needed <= buf.size) return
         var cap = buf.size
-        while (cap < size + extra) cap *= 2
+        while (cap < needed) {
+            cap = if (cap > Int.MAX_VALUE / 2) needed else cap * 2
+        }
         buf = buf.copyOf(cap)
     }
 }

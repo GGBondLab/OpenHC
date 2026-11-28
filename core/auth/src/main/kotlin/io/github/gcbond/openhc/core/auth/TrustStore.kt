@@ -47,14 +47,16 @@ class LocalIdentity(val serviceId: ServiceId, authId: ByteArray, privateKey: Byt
     }
 
     /** Ed25519 公钥（由私钥推出）。 */
-    val publicKey: ByteArray = Ed25519Keys.publicKey(seed)
-        get() = field.copyOf()
+    private val derivedPublicKey: ByteArray = Ed25519Keys.publicKey(seed)
+
+    val publicKey: ByteArray
+        get() = derivedPublicKey.copyOf()
 
     val authId: ByteArray get() = id.copyOf()
 
     val privateKey: ByteArray get() = seed.copyOf()
 
-    internal fun sign(message: ByteArray): ByteArray = Ed25519Keys.sign(seed, message)
+    internal fun sign(message: ByteArray): ByteArray = Ed25519Keys.sign(seed, derivedPublicKey, message)
 
     internal fun matches(serviceId: ServiceId, authId: ByteArray): Boolean =
         this.serviceId == serviceId && id.contentEquals(authId)

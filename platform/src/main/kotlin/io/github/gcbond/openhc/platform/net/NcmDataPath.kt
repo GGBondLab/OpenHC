@@ -203,6 +203,11 @@ class NcmDataPath(
     // ---------------------------------------------------------------- 手机 → 车机
 
     private fun receiveLoop() {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        } catch (_: Throwable) {
+            // 单元测试或受限环境下拿不到优先级时照常运行。
+        }
         val buffer = ByteArray(port.receiveSize)
         val replyBuffer = ByteArray(Ntb16.blockLength(port.outLayout, MAX_REPLY_FRAME, port.zlpPacketSize))
         val output = object : EthernetEndpoint.Output {
@@ -287,6 +292,11 @@ class NcmDataPath(
     // ---------------------------------------------------------------- 车机 → 手机
 
     private fun transmitLoop() {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        } catch (_: Throwable) {
+            // 同上。
+        }
         val layout = port.outLayout
         val packetOffset = layout.datagramOffset + Ethernet.HEADER_LENGTH
         val buffer = ByteArray(Ntb16.blockLength(layout, Ethernet.HEADER_LENGTH + MAX_PACKET, port.zlpPacketSize))

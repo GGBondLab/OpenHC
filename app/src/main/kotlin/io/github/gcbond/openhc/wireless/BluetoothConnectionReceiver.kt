@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import androidx.core.content.IntentCompat
 import io.github.gcbond.openhc.OpenHcApp
 import io.github.gcbond.openhc.platform.log.Log
+import io.github.gcbond.openhc.settings.WirelessPreferences
 
 /**
  * 「蓝牙连上自动连接」的入口：手机的经典蓝牙连上 / 断开车机时（系统广播 ACL_CONNECTED / ACL_DISCONNECTED），
@@ -16,7 +17,7 @@ import io.github.gcbond.openhc.platform.log.Log
  * （车机系统要允许本应用在后台被拉起）。
  *
  * 清单里默认不启用，只在开关开着、且没开「只用数据线连接」时启用（[sync]），免得每连一个蓝牙设备都拉起本应用。
- * 只认蓝牙设备类是「手机」的（[BluetoothTrigger.isPhone]），耳机、音箱、手表不算。
+ * 认蓝牙设备类是「手机」的（[BluetoothTrigger.isPhone]）或已经在 [WirelessPreferences.knownPhones] 记录过的手机。
  */
 class BluetoothConnectionReceiver : BroadcastReceiver() {
 
@@ -27,18 +28,19 @@ class BluetoothConnectionReceiver : BroadcastReceiver() {
             else -> return
         }
         val device = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java) ?: return
-        // 读设备类在安卓 12 起要「附近的设备」权限；没有时读不到，当作不是手机（没这个权限无线本来也连不了）。
+        // 读设备类在安卓 12 起要「附近的设备」权限；没有时读不到，已记住无线成功过的地址仍允许放行。
         val major = try {
             device.bluetoothClass?.majorDeviceClass
         } catch (e: SecurityException) {
             null
         }
-        if (!BluetoothTrigger.isPhone(major)) return
         val address = try {
             device.address
         } catch (e: RuntimeException) {
             null
         } ?: return
+        val knownPhones = WirelessPreferences(context).knownPhones
+        if (!BluetoothTrigger.matches(major, address, knownPhones)) return
         val app = context.applicationContext as? OpenHcApp ?: return
         app.wireless.onPhoneBluetooth(connected, address)
     }
@@ -49,7 +51,11 @@ class BluetoothConnectionReceiver : BroadcastReceiver() {
         /** 按设置启用或停用清单里的这个接收器。立即生效，不影响正在运行的进程。 */
         fun sync(context: Context, enabled: Boolean) {
             val component = ComponentName(context, BluetoothConnectionReceiver::class.java)
-            val state = if (enabled) PackageManager.COMPONENT_ENABLED_STATE_ENABLED else PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+            val state = if (enabled) {
+                PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            }
             try {
                 val pm = context.packageManager
                 if (pm.getComponentEnabledSetting(component) == state) return
@@ -69,6 +75,10 @@ object BluetoothTrigger {
 
     /** 连上的是不是手机；读不到设备类时不算。 */
     fun isPhone(majorDeviceClass: Int?): Boolean = majorDeviceClass == MAJOR_PHONE
+
+    /** 认设备类为手机，或属于已经用无线连成功过的手机地址（防部分手机初次 ACL 广播时 CoD 未就绪漏触发）。 */
+    fun matches(majorDeviceClass: Int?, address: String?, knownPhones: Set<String>): Boolean =
+        isPhone(majorDeviceClass) || (address != null && knownPhones.any { it.equals(address.trim(), ignoreCase = true) })
 
     /** 要不要听手机蓝牙连上：开关开着、没开「只用数据线连接」。 */
     fun listens(connectOnBluetooth: Boolean, wiredOnly: Boolean): Boolean = connectOnBluetooth && !wiredOnly

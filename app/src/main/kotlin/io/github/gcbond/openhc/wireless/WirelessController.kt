@@ -68,7 +68,7 @@ import java.io.File
 import java.io.IOException
 import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.concurrent.thread
+import androidx.compose.runtime.Stable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -109,6 +109,7 @@ import kotlinx.coroutines.flow.update
  * 线程：调度在自己的 [HandlerThread] 上串行执行，公开方法可以在任意线程调用（[sendInput] 在主线程，直接投到协议线程）。
  * 日志标签 `OpenHC-Wireless`。
  */
+@Stable
 class WirelessController(
     context: Context,
     private val wiredActive: () -> Boolean,
@@ -131,10 +132,11 @@ class WirelessController(
     }
 
     private val app: Context = context.applicationContext ?: context
+    private val openHcApp: OpenHcApp? get() = app as? OpenHcApp
 
     /** 「连接时暂停车机 WiFi 扫描」；单元测试里没有应用对象时为 null。 */
-    private val scanPause: ScanPause? get() = (app as? OpenHcApp)?.scanPause
-    private val carHotspotAuto: CarHotspotAuto? get() = (app as? OpenHcApp)?.carHotspotAuto
+    private val scanPause: ScanPause? get() = openHcApp?.scanPause
+    private val carHotspotAuto: CarHotspotAuto? get() = openHcApp?.carHotspotAuto
     private val settings = AppSettings(app)
     private val worker = HandlerThread("OpenHC-Wireless").also { it.start() }
     private val handler = Handler(worker.looper)
@@ -200,8 +202,15 @@ class WirelessController(
     /** 用户点了停止：空闲说明显示「手机蓝牙重新连上时再自动连」，下次开始连接时清掉。 */
     private var userStopped = false
 
-    /** 正在等界面带到前台再拨（那 1.5 秒里别的入口不拨，免得拨成另一台）。 */
-    private var waitingForUi = false
+    /** 正在等界面带到前台再拨（超时前界面回到前台会立即接续拨号，不再白等或误判失败）。 */
+    private class PendingSurfaceDial(
+        val target: ReconnectTarget,
+        val resumeWiredAfter: Boolean,
+        val timeout: Runnable,
+    )
+
+    private var pendingSurfaceDial: PendingSurfaceDial? = null
+    private val waitingForUi: Boolean get() = pendingSurfaceDial != null
     private var autoRetry: Runnable? = null
     private var lastWiredActive = false
 
@@ -249,6 +258,7 @@ class WirelessController(
     fun start() = post {
         if (attempt != null) return@post
         cancelAutoRetry()
+        cancelPendingSurfaceDial()
         begin(Kind.MANUAL, dial = manualDialTarget())
     }
 
@@ -279,8 +289,23 @@ class WirelessController(
         teardown(current)
     }
 
-    /** 界面回到前台（含开机自动打开）：「自动连接手机」开着就拨最近连成功的那台（一次蓝牙连接只拨一次）。 */
+    /** 界面回到前台（含开机自动打开）：若正在等界面出来拨号就立即接续；否则「自动连接手机」开着就拨最近连成功的那台。 */
     fun onAppForeground() = post {
+        val pending = pendingSurfaceDial
+        if (pending != null) {
+            pendingSurfaceDial = null
+            handler.removeCallbacks(pending.timeout)
+            if (attempt == null && !wiredActive() && !phoneOnCable() && BluetoothTrigger.listens(wirelessPrefs.connectOnBluetooth, wirelessPrefs.wiredOnly)) {
+                Log.i(TAG, "界面已到前台，继续主动拨手机（${MacText.mask(pending.target.address)}）")
+                begin(Kind.RECONNECT, reconnect = pending.target, resumeWiredAfter = pending.resumeWiredAfter)
+                if (attempt == null && pending.resumeWiredAfter) {
+                    Log.i(TAG, "这次没拨成，让有线回到等插线")
+                    resumeWiredWaiting()
+                }
+            }
+            syncHotspotStandby()
+            return@post
+        }
         dialFromUi("界面回到前台")
         // 在后台申请热点会被系统拒绝：回到前台时补一次（已经开着或在申请时什么都不做）。
         if (hotspotStandby) warmHotspot()
@@ -335,6 +360,7 @@ class WirelessController(
     fun onWiredOnlyChanged() = post {
         syncBluetoothReceiver()
         cancelAutoRetry()
+        cancelPendingSurfaceDial()
         if (!wirelessPrefs.wiredOnly) {
             refreshIdleStatus("关掉了只用数据线连接")
             return@post
@@ -464,9 +490,8 @@ class WirelessController(
     ) {
         if (attempt != null) return
         userStopped = false
-        // 熄火不一定结束进程：之前暂停的车机 WiFi 扫描没恢复成的，每次开始无线连接时补一次。
-        scanPause?.recover("开始无线连接")
-        carHotspotAuto?.recover("开始无线连接")
+        // 熄火不一定结束进程：之前暂停的车机 WiFi 扫描或自动打开的热点没恢复成的，有待恢复记号时才补一次。
+        openHcApp?.recoverAdbSwitchesIfNeeded("开始无线连接")
         if (wirelessPrefs.wiredOnly) return blocked(kind, WirelessNotice.WiredOnly, AutoHold.WIRED_ONLY)
         if (wiredActive()) return blocked(kind, WirelessNotice.WiredActive, AutoHold.WIRED_ACTIVE)
         // 本地热点安卓 8.0 起才有，更早的车机用不了无线。不要求车机 WiFi 开着：开热点时单射频车机自己的 WiFi 本来就会断。
@@ -580,7 +605,6 @@ class WirelessController(
         setAutoHold(null)
         apply(WirelessSignal.AttemptStarted(current.id, addressMismatch, autoReconnect = kind == Kind.AUTO, direct = directGroup))
         current.runner.start()
-        watchTermination(current)
     }
 
     /** 第 [id] 次连接用的「自动打开车机热点」：只关这次连接自己打开的。 */
@@ -752,24 +776,35 @@ class WirelessController(
             if (attempt == null) giveUp()
             return
         }
-        Log.i(TAG, "车机主动拨手机（${MacText.mask(address)}）：$why；界面带到前台 $SURFACE_WAIT_MS 毫秒后再拨")
-        waitingForUi = true
-        handler.postDelayed({
-            waitingForUi = false
-            when {
-                attempt != null -> Log.i(TAG, "等界面时已经有连接在进行，不拨了")
-                !uiVisible() -> {
-                    Log.i(TAG, "界面没能打开（多半缺悬浮窗权限或被系统拦了），这次不拨：开不了热点")
-                    setAutoHold(AutoHold.UI_NOT_SHOWN)
-                    giveUp()
+        Log.i(TAG, "车机主动拨手机（${MacText.mask(address)}）：$why；等界面带到前台（最多 $SURFACE_WAIT_MS 毫秒）后再拨")
+        val timeout = object : Runnable {
+            override fun run() {
+                val pending = pendingSurfaceDial ?: return
+                if (pending.timeout !== this) return
+                pendingSurfaceDial = null
+                when {
+                    attempt != null -> Log.i(TAG, "等界面时已经有连接在进行，不拨了")
+                    !uiVisible() -> {
+                        Log.i(TAG, "界面没能打开（多半缺悬浮窗权限或被系统拦了），这次不拨：开不了热点")
+                        setAutoHold(AutoHold.UI_NOT_SHOWN)
+                        giveUp()
+                    }
+                    else -> {
+                        begin(Kind.RECONNECT, reconnect = target, resumeWiredAfter = resumeWiredAfter)
+                        if (attempt == null) giveUp()
+                    }
                 }
-                else -> {
-                    begin(Kind.RECONNECT, reconnect = target, resumeWiredAfter = resumeWiredAfter)
-                    if (attempt == null) giveUp()
-                }
+                syncHotspotStandby()
             }
-            syncHotspotStandby()
-        }, SURFACE_WAIT_MS)
+        }
+        pendingSurfaceDial = PendingSurfaceDial(target, resumeWiredAfter, timeout)
+        handler.postDelayed(timeout, SURFACE_WAIT_MS)
+    }
+
+    private fun cancelPendingSurfaceDial() {
+        val pending = pendingSurfaceDial ?: return
+        pendingSurfaceDial = null
+        handler.removeCallbacks(pending.timeout)
     }
 
     private fun uiVisible(): Boolean = (app as? OpenHcApp)?.uiVisibility?.visible != false
@@ -810,17 +845,24 @@ class WirelessController(
     /**
      * 这台手机的经典蓝牙现在连没连着车机。用的是系统的隐藏接口（BluetoothDevice.isConnected），拿不到时返回 null（不知道）。
      */
-    private fun phoneConnected(adapter: BluetoothAdapter, address: String): Boolean? = try {
-        val device = adapter.getRemoteDevice(address)
-        (android.bluetooth.BluetoothDevice::class.java.getMethod("isConnected").invoke(device) as? Boolean).also {
-            Log.i(TAG, "手机蓝牙连着车机：$it（${MacText.mask(address)}）")
+    private fun phoneConnected(adapter: BluetoothAdapter, address: String): Boolean? {
+        val method = bluetoothIsConnectedMethod
+        if (method == null) {
+            Log.i(TAG, "查不到手机蓝牙连没连着（接口不可用）")
+            return null
         }
-    } catch (e: ReflectiveOperationException) {
-        Log.i(TAG, "查不到手机蓝牙连没连着（${e.javaClass.simpleName}）")
-        null
-    } catch (e: RuntimeException) {
-        Log.i(TAG, "查不到手机蓝牙连没连着（${e.javaClass.simpleName}）")
-        null
+        return try {
+            val device = adapter.getRemoteDevice(address)
+            (method.invoke(device) as? Boolean).also {
+                Log.i(TAG, "手机蓝牙连着车机：$it（${MacText.mask(address)}）")
+            }
+        } catch (e: ReflectiveOperationException) {
+            Log.i(TAG, "查不到手机蓝牙连没连着（${e.javaClass.simpleName}）")
+            null
+        } catch (e: RuntimeException) {
+            Log.i(TAG, "查不到手机蓝牙连没连着（${e.javaClass.simpleName}）")
+            null
+        }
     }
 
     /** 清单里「手机蓝牙连上」的入口：开关开着、没开只用数据线连接时启用。 */
@@ -866,6 +908,10 @@ class WirelessController(
 
     /** 让出还在等手机的无线连接：默认只让自动进入的等回连，[anyKind] 时扫码等待、车机在拨也让；让了返回 true。 */
     private fun yieldWaiting(why: String, anyKind: Boolean = false): Boolean {
+        if (pendingSurfaceDial != null) {
+            Log.i(TAG, "$why，取消待界面回来的主动回连，让给有线")
+            cancelPendingSurfaceDial()
+        }
         val current = attempt ?: return false
         if (!anyKind && current.kind != Kind.AUTO) return false
         if (!isWaiting(current)) return false
@@ -1008,8 +1054,13 @@ class WirelessController(
         val runner: SocketRunner = SocketRunner(
             bridge,
             { event -> onProtocolEvent(this, event) },
-            SocketRunner.Options(threadName = "OpenHC-Wireless-$id", log = { Log.i(TAG, "[$id] 执行器：$it") }),
+            SocketRunner.Options(
+                threadName = "OpenHC-Wireless-$id",
+                log = { Log.i(TAG, "[$id] 执行器：$it") },
+                onTerminated = { post { onRunnerTerminated(this) } },
+            ),
         )
+        val videoOptions: VideoDecoder.Options = io.github.gcbond.openhc.settings.VideoPreferences(app).decoderOptions()
         val causes = WirelessEndTracker()
         var touchNegotiated = false
         var keyNegotiated = false
@@ -1140,7 +1191,10 @@ class WirelessController(
     private fun prepareDecoder(current: Attempt, video: VideoParameters) {
         val decoder = synchronized(current.decoderLock) {
             if (current.tearingDown) return
-            current.videoDecoder ?: VideoDecoder(DecoderListener(current.id)).also {
+            current.videoDecoder ?: VideoDecoder(
+                DecoderListener(current.id),
+                current.videoOptions,
+            ).also {
                 current.videoDecoder = it
                 current.sink.target = it
                 mutableDecoder.value = it
@@ -1156,20 +1210,6 @@ class WirelessController(
 
         override fun onDecoderUnavailable(detail: String) {
             post { if (attempt?.id == attemptId) apply(WirelessSignal.DecoderProblem(detail)) }
-        }
-    }
-
-    /** 执行器意外退出（不会有 Ended 事件）时也要能收尾：另开一个线程等它结束。 */
-    private fun watchTermination(current: Attempt) {
-        thread(name = "OpenHC-WirelessWatch-${current.id}", isDaemon = true) {
-            try {
-                while (!current.runner.awaitTermination(WATCH_SLICE_MS)) {
-                    // 一直等到执行器结束。
-                }
-            } catch (e: InterruptedException) {
-                return@thread
-            }
-            post { onRunnerTerminated(current) }
         }
     }
 
@@ -1213,7 +1253,7 @@ class WirelessController(
     private fun maybeFinish(current: Attempt) {
         if (current.finished || !current.tearingDown || !current.runner.isTerminated) return
         current.finished = true
-        scanPause?.sessionEnded(current.id)
+        openHcApp?.scanPauseIfCreated?.sessionEnded(current.id)
         // 兜底：广播、GATT、定时一样不留。
         current.beacon?.stop("兜底")
         if (current.beacon?.isClean == false) Log.e(TAG, "[${current.id}] 广播资源没有收干净")
@@ -1336,8 +1376,8 @@ class WirelessController(
         /** 同一台手机两次车机主动回连之间至少隔这么久。 */
         const val RECONNECT_COOLDOWN_MS = 60_000L
 
-        /** 车机主动回连时界面不在前台：带到前台后等这么久再拨（界面一般 1 秒内出来；出不来也照拨）。 */
-        const val SURFACE_WAIT_MS = 1_500L
+        /** 车机主动回连时界面不在前台：带到前台后最多等这么久再判打不开（期间界面一到前台会提前立即拨）。 */
+        const val SURFACE_WAIT_MS = 3_500L
 
         const val TAG = "OpenHC-Wireless"
 
@@ -1349,7 +1389,16 @@ class WirelessController(
 
         /** 广播序列号的取值个数（1 字节）。 */
         const val SEQUENCE_RANGE = 256
-        const val WATCH_SLICE_MS = 60_000L
         const val FOREGROUND_FAILED = "前台服务启动失败"
+
+        val bluetoothIsConnectedMethod: java.lang.reflect.Method? by lazy {
+            try {
+                android.bluetooth.BluetoothDevice::class.java.getMethod("isConnected")
+            } catch (_: ReflectiveOperationException) {
+                null
+            } catch (_: RuntimeException) {
+                null
+            }
+        }
     }
 }

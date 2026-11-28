@@ -21,4 +21,14 @@ class BluetoothTriggerTest {
         assertFalse(BluetoothTrigger.listens(connectOnBluetooth = false, wiredOnly = false))
         assertFalse(BluetoothTrigger.listens(connectOnBluetooth = true, wiredOnly = true))
     }
+
+    @Test
+    fun knownPhonesMatchEvenWithoutPhoneClass() {
+        val known = setOf("70:11:22:33:44:55")
+        assertTrue(BluetoothTrigger.matches(null, "70:11:22:33:44:55", known))
+        assertTrue(BluetoothTrigger.matches(0x1F00, "70:11:22:33:44:55", known))
+        assertFalse(BluetoothTrigger.matches(null, "AA:BB:CC:DD:EE:FF", known))
+        assertFalse(BluetoothTrigger.matches(0x0400, "AA:BB:CC:DD:EE:FF", known))
+        assertTrue(BluetoothTrigger.matches(0x0200, "AA:BB:CC:DD:EE:FF", known))
+    }
 }

@@ -402,10 +402,18 @@ class WifiDirectGroupOwner(
         return true
     }
 
+    private var cleanedUp = false
+
     private fun end() {
         if (stopped) return
         stopped = true
         stage = Stage.ENDED
+        cleanupGroup(removeActiveGroup = true)
+    }
+
+    private fun cleanupGroup(removeActiveGroup: Boolean) {
+        if (cleanedUp) return
+        cleanedUp = true
         handler.removeCallbacksAndMessages(null)
         releaseCellular()
         val m = manager
@@ -414,7 +422,6 @@ class WifiDirectGroupOwner(
             thread.quitSafely()
             return
         }
-        log("拆掉直连组")
         var finished = false
         // 系统回话和超时谁先到谁收尾，只收一次。
         val finish = Runnable {
@@ -436,6 +443,16 @@ class WifiDirectGroupOwner(
             removed = true
             if (pinned) unpin(m, ch) { handler.post(finish) } else finish.run()
         }
+        if (!removeActiveGroup) {
+            if (pinned) {
+                handler.postDelayed(finish, UNPIN_WAIT_MS)
+                unpin(m, ch) { handler.post(finish) }
+            } else {
+                finish.run()
+            }
+            return
+        }
+        log("拆掉直连组")
         handler.postDelayed(finish, if (pinned) UNPIN_WAIT_MS else REMOVE_WAIT_MS)
         try {
             m.removeGroup(
@@ -485,16 +502,22 @@ class WifiDirectGroupOwner(
         stage = Stage.ENDED
         handler.removeCallbacks(poll)
         handler.removeCallbacks(watch)
+        releaseCellular()
         log("直连组没建成：$message")
         if (!stopped) events.onFailed(message)
+        stopped = true
+        cleanupGroup(removeActiveGroup = false)
     }
 
     private fun lose(message: String) {
         if (stage != Stage.READY) return fail(message)
         stage = Stage.ENDED
         handler.removeCallbacks(watch)
+        releaseCellular()
         log(message)
         if (!stopped) events.onLost(message)
+        stopped = true
+        cleanupGroup(removeActiveGroup = false)
     }
 
     // ---------------------------------------------------------------- 系统调用的小包装

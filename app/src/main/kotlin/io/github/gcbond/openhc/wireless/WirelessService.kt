@@ -6,8 +6,10 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationChannelCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -32,6 +34,8 @@ class WirelessService : Service() {
     private var lastStartId = 0
     private var leaving = false
     private var lastNotification: Content? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val listener = WirelessController.HostListener { onControllerChanged() }
 
@@ -40,6 +44,7 @@ class WirelessService : Service() {
         controller = (application as OpenHcApp).wireless
         controller.addHostListener(listener)
         createChannel()
+        initLocks()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -54,6 +59,7 @@ class WirelessService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        releaseLocks()
         controller.removeHostListener(listener)
         if (inForeground) controller.serviceInForeground = false
         if (!leaving) controller.onServiceDestroyed()
@@ -67,6 +73,7 @@ class WirelessService : Service() {
             inForeground = true
             controller.serviceInForeground = true
             lastNotification = content
+            acquireLocks()
             true
         } catch (e: RuntimeException) {
             Log.e(TAG, "进不了前台", e)
@@ -100,12 +107,60 @@ class WirelessService : Service() {
     private fun leave() {
         if (leaving) return
         leaving = true
+        releaseLocks()
         if (inForeground) {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             inForeground = false
             controller.serviceInForeground = false
         }
         stopSelf(lastStartId)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun initLocks() {
+        try {
+            val wm = applicationContext.getSystemService(WIFI_SERVICE) as? WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm?.createWifiLock(mode, "OpenHC:Wireless")?.apply { setReferenceCounted(false) }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "创建 WifiLock 失败：${e.message}")
+        }
+        try {
+            val pm = applicationContext.getSystemService(POWER_SERVICE) as? PowerManager
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OpenHC:Wireless")?.apply { setReferenceCounted(false) }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "创建 WakeLock 失败：${e.message}")
+        }
+    }
+
+    private fun acquireLocks() {
+        try {
+            if (wifiLock?.isHeld == false) wifiLock?.acquire()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "申请 WifiLock 失败：${e.message}")
+        }
+        try {
+            if (wakeLock?.isHeld == false) wakeLock?.acquire()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "申请 WakeLock 失败：${e.message}")
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (e: RuntimeException) {
+            // 忽略。
+        }
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (e: RuntimeException) {
+            // 忽略。
+        }
     }
 
     private fun createChannel() {

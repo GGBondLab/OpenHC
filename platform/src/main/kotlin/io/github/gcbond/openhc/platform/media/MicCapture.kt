@@ -114,12 +114,15 @@ class MicCapture(
     private var noise: NoiseSuppressor? = null
     private var thread: Thread? = null
     private var started = false
+    private var closed = false
+    private var loopActive = false
 
     /** 开 AudioRecord、开始采集。只能调用一次；开不了返回 false（原因经 [Listener] 报出）。 */
     fun start(): Boolean {
         synchronized(lock) {
             check(!started) { "start 只能调用一次" }
             started = true
+            if (closed) return false
         }
         val opened = open() ?: return false
         val rec = opened.record
@@ -137,13 +140,28 @@ class MicCapture(
             listener.onEvent(Event.OpenFailed("开始录音后状态不对（多半被别的应用占着）"))
             return false
         }
-        synchronized(lock) {
-            record = rec
-            running = true
+        val worker = Thread({ loop(rec, opened.rate) }, "OpenHC-MicCapture")
+        val cancelled = synchronized(lock) {
+            if (closed) {
+                true
+            } else {
+                record = rec
+                running = true
+                loopActive = true
+                thread = worker
+                false
+            }
+        }
+        if (cancelled) {
+            try {
+                rec.stop()
+            } catch (e: IllegalStateException) {
+                // 忽略。
+            }
+            releaseAll(rec)
+            return false
         }
         listener.onEvent(Event.Opened(opened.source, opened.rate, opened.bufferBytes, echoState, noiseState))
-        val worker = Thread({ loop(rec, opened.rate) }, "OpenHC-MicCapture")
-        thread = worker
         worker.start()
         return true
     }
@@ -151,22 +169,33 @@ class MicCapture(
     /** 停止采集、释放 AudioRecord 和音效，等采集线程退出（最多 [JOIN_MILLIS]）。可以重复调用。 */
     override fun close() {
         val rec: AudioRecord?
+        val worker: Thread?
         synchronized(lock) {
+            closed = true
             running = false
             rec = record
+            worker = thread
         }
         try {
             rec?.stop()
         } catch (e: IllegalStateException) {
             // 没在录音也没关系。
         }
-        thread?.let { if (it !== Thread.currentThread()) it.join(JOIN_MILLIS) }
+        if (worker != null && worker !== Thread.currentThread()) {
+            try {
+                worker.join(JOIN_MILLIS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        var toRelease: AudioRecord? = null
         synchronized(lock) {
-            if (record != null) {
-                releaseAll(record!!)
+            if (!loopActive && record != null) {
+                toRelease = record
                 record = null
             }
         }
+        toRelease?.let { releaseAll(it) }
     }
 
     // 权限由调用方事先检查；没有权限时构造或开始录音会抛异常，下面按开不了处理。
@@ -248,47 +277,59 @@ class MicCapture(
         var windowChunks = 0L
         var windowPeak = 0
         var windowSilent = 0L
-        while (running) {
-            val n = rec.read(input, 0, inputFrames)
-            if (n < 0) {
-                readErrors++
-                if (readErrors <= MAX_READ_ERROR_EVENTS) listener.onEvent(Event.ReadFailed(n))
-                if (n == AudioRecord.ERROR_INVALID_OPERATION || n == ERROR_DEAD_OBJECT) break
-                Thread.sleep(READ_ERROR_PAUSE_MILLIS)
-                continue
+        try {
+            while (running) {
+                val n = rec.read(input, 0, inputFrames)
+                if (n < 0) {
+                    readErrors++
+                    if (readErrors <= MAX_READ_ERROR_EVENTS) listener.onEvent(Event.ReadFailed(n))
+                    if (n == AudioRecord.ERROR_INVALID_OPERATION || n == ERROR_DEAD_OBJECT) break
+                    Thread.sleep(READ_ERROR_PAUSE_MILLIS)
+                    continue
+                }
+                if (n == 0) continue
+                val produced = resampler?.process(input, n, converted) ?: n
+                System.arraycopy(if (resampler != null) converted else input, 0, pending, pendingFrames, produced)
+                pendingFrames += produced
+                while (pendingFrames >= chunkFrames) {
+                    val chunkPeak = peakOf(pending, chunkFrames)
+                    if (chunkPeak == 0) {
+                        silent++
+                        windowSilent++
+                    }
+                    if (chunkPeak > peak) peak = chunkPeak
+                    if (chunkPeak > windowPeak) windowPeak = chunkPeak
+                    windowChunks++
+                    PcmResampler.toLittleEndian(pending, chunkFrames, format.channels, out, 0)
+                    try {
+                        sink.onPcm(out, format.chunkBytes)
+                    } catch (e: RuntimeException) {
+                        sinkErrors++
+                    }
+                    System.arraycopy(pending, chunkFrames, pending, 0, pendingFrames - chunkFrames)
+                    pendingFrames -= chunkFrames
+                    chunks++
+                    // 开头 1 秒报一次电平，之后每 10 秒一次：分得清「采到的是静音」和「送出去了对方没收」。
+                    if (chunks == LEVEL_FIRST_CHUNKS || windowChunks >= LEVEL_EVERY_CHUNKS) {
+                        listener.onEvent(Event.Level(windowChunks, windowPeak, windowSilent))
+                        windowChunks = 0
+                        windowPeak = 0
+                        windowSilent = 0
+                    }
+                }
             }
-            if (n == 0) continue
-            val produced = resampler?.process(input, n, converted) ?: n
-            System.arraycopy(if (resampler != null) converted else input, 0, pending, pendingFrames, produced)
-            pendingFrames += produced
-            while (pendingFrames >= chunkFrames) {
-                val chunkPeak = peakOf(pending, chunkFrames)
-                if (chunkPeak == 0) {
-                    silent++
-                    windowSilent++
-                }
-                if (chunkPeak > peak) peak = chunkPeak
-                if (chunkPeak > windowPeak) windowPeak = chunkPeak
-                windowChunks++
-                PcmResampler.toLittleEndian(pending, chunkFrames, format.channels, out, 0)
-                try {
-                    sink.onPcm(out, format.chunkBytes)
-                } catch (e: RuntimeException) {
-                    sinkErrors++
-                }
-                System.arraycopy(pending, chunkFrames, pending, 0, pendingFrames - chunkFrames)
-                pendingFrames -= chunkFrames
-                chunks++
-                // 开头 1 秒报一次电平，之后每 10 秒一次：分得清「采到的是静音」和「送出去了对方没收」。
-                if (chunks == LEVEL_FIRST_CHUNKS || windowChunks >= LEVEL_EVERY_CHUNKS) {
-                    listener.onEvent(Event.Level(windowChunks, windowPeak, windowSilent))
-                    windowChunks = 0
-                    windowPeak = 0
-                    windowSilent = 0
+        } finally {
+            var toRelease: AudioRecord? = null
+            synchronized(lock) {
+                loopActive = false
+                if (closed && record === rec) {
+                    toRelease = rec
+                    record = null
                 }
             }
+            toRelease?.let { releaseAll(it) }
+            listener.onEvent(Event.Stopped(chunks, readErrors, sinkErrors, peak, silent))
         }
-        listener.onEvent(Event.Stopped(chunks, readErrors, sinkErrors, peak, silent))
     }
 
     private fun peakOf(samples: ShortArray, frames: Int): Int {

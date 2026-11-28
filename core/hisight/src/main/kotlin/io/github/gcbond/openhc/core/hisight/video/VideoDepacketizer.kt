@@ -58,7 +58,6 @@ internal class VideoDepacketizer(sessionKey: ByteArray, private val sink: Access
 
     private var pes = ByteArray(INITIAL_BUFFER)
     private var pesLength = 0
-    private var es = ByteArray(INITIAL_BUFFER)
 
     var failed = false
         private set
@@ -105,23 +104,44 @@ internal class VideoDepacketizer(sessionKey: ByteArray, private val sink: Access
         while (pos < to) {
             when (state) {
                 STATE_LENGTH -> {
-                    pos = fillHead(data, pos, to, 4)
-                    if (headFill == 4) {
-                        headFill = 0
-                        val length = be32(head, 0)
+                    if (headFill == 0 && to - pos >= 4) {
+                        val length = be32(data, pos)
+                        pos += 4
                         if (length < 1 || length > MAX_PACKET) {
                             throw MalformedMessageException("视频 RTP 包长 $length 不在 1..10MiB")
                         }
                         if (length < 12) throw MalformedMessageException("视频 RTP 包不足 12 字节")
                         packetLength = length.toInt()
-                        state = STATE_FIXED_HEADER
+                        if (to - pos >= 12) {
+                            parseFixedHeader(data, pos)
+                            pos += 12
+                        } else {
+                            state = STATE_FIXED_HEADER
+                        }
+                    } else {
+                        pos = fillHead(data, pos, to, 4)
+                        if (headFill == 4) {
+                            headFill = 0
+                            val length = be32(head, 0)
+                            if (length < 1 || length > MAX_PACKET) {
+                                throw MalformedMessageException("视频 RTP 包长 $length 不在 1..10MiB")
+                            }
+                            if (length < 12) throw MalformedMessageException("视频 RTP 包不足 12 字节")
+                            packetLength = length.toInt()
+                            state = STATE_FIXED_HEADER
+                        }
                     }
                 }
                 STATE_FIXED_HEADER -> {
-                    pos = fillHead(data, pos, to, 12)
-                    if (headFill == 12) {
-                        headFill = 0
-                        parseFixedHeader()
+                    if (headFill == 0 && to - pos >= 12) {
+                        parseFixedHeader(data, pos)
+                        pos += 12
+                    } else {
+                        pos = fillHead(data, pos, to, 12)
+                        if (headFill == 12) {
+                            headFill = 0
+                            parseFixedHeader(head, 0)
+                        }
                     }
                 }
                 STATE_SKIP_CSRC, STATE_SKIP_EXTENSION -> {
@@ -181,18 +201,18 @@ internal class VideoDepacketizer(sessionKey: ByteArray, private val sink: Access
         return pos + n
     }
 
-    private fun parseFixedHeader() {
-        val b0 = head[0].toInt() and 0xFF
-        val b1 = head[1].toInt() and 0xFF
+    private fun parseFixedHeader(buf: ByteArray, at: Int) {
+        val b0 = buf[at].toInt() and 0xFF
+        val b1 = buf[at + 1].toInt() and 0xFF
         if (b0 ushr 6 != 2) throw MalformedMessageException("视频 RTP 版本不是 2")
         if (b0 and 0x20 != 0) throw MalformedMessageException("视频 RTP 带 padding，未实现")
         if (b1 and 0x7F != PAYLOAD_TYPE) throw MalformedMessageException("视频 RTP 载荷类型不是 96")
         hasExtension = b0 and 0x10 != 0
         csrcCount = b0 and 0x0F
         marker = b1 and 0x80 != 0
-        sequence = be16(head, 2)
-        timestamp = be32(head, 4)
-        ssrc = be32(head, 8)
+        sequence = be16(buf, at + 2)
+        timestamp = be32(buf, at + 4)
+        ssrc = be32(buf, at + 8)
         headerLength = 12 + 4 * csrcCount
         if (headerLength >= packetLength) throw MalformedMessageException("视频 RTP 的 CSRC 截断或缺少载荷")
         if (hasExtension && headerLength + 4 >= packetLength) throw MalformedMessageException("视频 RTP 扩展头截断")
@@ -289,11 +309,10 @@ internal class VideoDepacketizer(sessionKey: ByteArray, private val sink: Access
         if (esOffset + AesCtr.IV_BYTES >= n) throw MalformedMessageException("视频 PES 缺少完整 IV 或 ES 为空")
         val cipherStart = esOffset + AesCtr.IV_BYTES
         val esLength = n - cipherStart
-        if (es.size < esLength) es = grow(es, 0, esLength)
-        cipher.decryptInto(p, esOffset, p, cipherStart, esLength, es, 0)
+        cipher.decryptInto(p, esOffset, p, cipherStart, esLength, p, cipherStart)
 
-        unit.data = es
-        unit.offset = 0
+        unit.data = p
+        unit.offset = cipherStart
         unit.length = esLength
         unit.rtpTimestamp = timestamp
         unit.pts90k = pts

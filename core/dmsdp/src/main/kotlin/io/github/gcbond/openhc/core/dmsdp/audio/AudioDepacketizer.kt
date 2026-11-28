@@ -131,8 +131,12 @@ internal class AudioDepacketizer(
                 detect(final = false)
             }
             Mode.STREAMING -> {
-                buffer.append(data, offset, length)
-                drain()
+                if (buffer.size == 0) {
+                    drainDirect(data, offset, offset + length)
+                } else {
+                    buffer.append(data, offset, length)
+                    drain()
+                }
             }
         }
     }
@@ -142,6 +146,8 @@ internal class AudioDepacketizer(
         if (mode == Mode.DETECTING && bytes > 0) detect(final = true)
         if (mode == Mode.STREAMING && buffer.size > 0) note("连接结束时留下 ${buffer.size} 字节不完整的帧")
         buffer.clear()
+        frameScratch = ByteArray(0)
+        payloadScratch = ByteArray(0)
     }
 
     // ---------------- 识别 ----------------
@@ -253,13 +259,37 @@ internal class AudioDepacketizer(
 
     private fun decryptPayloadCopy(payload: ByteArray): ByteArray? {
         if (payload.size <= AesCtr.IV_BYTES) return null
-        System.arraycopy(payload, 0, iv, 0, AesCtr.IV_BYTES)
         val plain = ByteArray(payload.size - AesCtr.IV_BYTES)
-        cipher.transform(iv, payload, AesCtr.IV_BYTES, plain.size, plain, 0)
+        cipher.transformWithIvAt(payload, 0, payload, AesCtr.IV_BYTES, plain.size, plain, 0)
         return plain
     }
 
     // ---------------- 认出来之后逐帧拆 ----------------
+
+    private fun drainDirect(data: ByteArray, from: Int, to: Int) {
+        val trial = plan ?: return
+        var pos = from
+        while (mode == Mode.STREAMING && pos < to) {
+            val body = trial.frame.bodyLength(data, pos, to)
+            if (body == NEED_MORE) {
+                buffer.append(data, pos, to - pos)
+                return
+            }
+            if (body == INVALID) {
+                mode = Mode.RAW
+                conclusion += "，之后失步"
+                note("帧头对不上了（失步），这条连接之后不再拆包，只交原始字节")
+                return
+            }
+            val total = trial.frame.headerBytes + body
+            if (to - pos < total) {
+                buffer.append(data, pos, to - pos)
+                return
+            }
+            onFrame(trial, data, pos + trial.frame.headerBytes, body)
+            pos += total
+        }
+    }
 
     private fun drain() {
         val trial = plan ?: return
@@ -304,10 +334,9 @@ internal class AudioDepacketizer(
                 noteLimited("载荷只有 $length 字节，装不下 IV，跳过")
                 return
             }
-            System.arraycopy(payload, from, iv, 0, AesCtr.IV_BYTES)
             length -= AesCtr.IV_BYTES
             if (payloadScratch.size < length) payloadScratch = ByteArray(grow(length))
-            cipher.transform(iv, payload, from + AesCtr.IV_BYTES, length, payloadScratch, 0)
+            cipher.transformWithIvAt(payload, from, payload, from + AesCtr.IV_BYTES, length, payloadScratch, 0)
             payload = payloadScratch
             from = 0
         }
@@ -375,14 +404,28 @@ internal class AudioDepacketizer(
      * 按一路声音（[AudioBus.lane]）记序号：每一路各自判断跳变。新出现的一路记一条诊断（不受诊断条数上限的限制，路数本身
      * 有上限）：带包尾路号的每一路都记，写明 SSRC 和它的路号；同一路里 SSRC 的路号变了也记一次。
      */
+    private var cachedLane0 = Long.MIN_VALUE
+    private var cachedStats0: LaneStats? = null
+    private var cachedLane1 = Long.MIN_VALUE
+    private var cachedStats1: LaneStats? = null
+
     private fun trackLane(lane: Long, ssrc: Long, sequence: Int, trailerBus: Long) {
-        val stats = lanes[lane]
+        val stats = when {
+            lane == cachedLane0 && cachedStats0 != null -> cachedStats0
+            lane == cachedLane1 && cachedStats1 != null -> cachedStats1
+            else -> lanes[lane]
+        }
         if (stats == null) {
             if (lanes.size >= MAX_TRACKED_LANES) {
                 untrackedPackets++
                 return
             }
-            lanes[lane] = LaneStats(sequence, AudioBus.keyOf(ssrc))
+            val created = LaneStats(sequence, AudioBus.keyOf(ssrc))
+            lanes[lane] = created
+            cachedLane1 = cachedLane0
+            cachedStats1 = cachedStats0
+            cachedLane0 = lane
+            cachedStats0 = created
             if (trailerBus >= 0) {
                 note(
                     "出现一路：${AudioBus.laneLabel(lane)}（包尾路号 $trailerBus；SSRC $ssrc，SSRC 里是" +
@@ -392,6 +435,12 @@ internal class AudioDepacketizer(
                 note("这条连接上出现了新的一路：${AudioBus.laneLabel(lane)}（SSRC $ssrc），各路分开计序号")
             }
             return
+        }
+        if (lane != cachedLane0) {
+            cachedLane1 = cachedLane0
+            cachedStats1 = cachedStats0
+            cachedLane0 = lane
+            cachedStats0 = stats
         }
         if (!stats.keyChangeNoted && AudioBus.keyOf(ssrc) != stats.key) {
             stats.keyChangeNoted = true
@@ -459,8 +508,7 @@ internal class AudioDepacketizer(
         if (bodyLength < AesCtr.IV_BYTES + RtpView.MIN_RTCP) return false
         val plainLength = bodyLength - AesCtr.IV_BYTES
         if (frameScratch.size < plainLength) frameScratch = ByteArray(grow(plainLength))
-        System.arraycopy(data, bodyAt, iv, 0, AesCtr.IV_BYTES)
-        cipher.transform(iv, data, bodyAt + AesCtr.IV_BYTES, plainLength, frameScratch, 0)
+        cipher.transformWithIvAt(data, bodyAt, data, bodyAt + AesCtr.IV_BYTES, plainLength, frameScratch, 0)
         return rtp.parse(frameScratch, 0, plainLength)
     }
 
@@ -856,12 +904,23 @@ internal object PcmProbe {
     /** [length] 字节的 16 位 PCM 够不够做判断。 */
     fun canJudge(length: Int, channels: Int): Boolean = length / 2 - channels.coerceIn(1, 8) >= MIN_DELTAS
 
-    /** 两种字节序里有一种像声音就算像；数据太短时不判断，当作像。 */
+    /** 两种字节序里有一种像声音就算像；数据太短时不判断，当作像。单遍扫描同时累计小端和大端差值。 */
     fun looksLikePcm(data: ByteArray, offset: Int, length: Int, channels: Int): Boolean {
-        val little = meanAbsDelta(data, offset, length, channels, bigEndian = false)
-        if (little.isNaN()) return true
-        val big = meanAbsDelta(data, offset, length, channels, bigEndian = true)
-        return minOf(little, big) < NOISE_LEVEL
+        val stride = channels.coerceIn(1, 8)
+        val samples = length / 2
+        val count = samples - stride
+        if (count < MIN_DELTAS) return true
+        var sumLe = 0L
+        var sumBe = 0L
+        for (i in stride until samples) {
+            val prevLe = sample(data, offset, i - stride, bigEndian = false)
+            val currLe = sample(data, offset, i, bigEndian = false)
+            sumLe += kotlin.math.abs(currLe - prevLe)
+            val prevBe = sample(data, offset, i - stride, bigEndian = true)
+            val currBe = sample(data, offset, i, bigEndian = true)
+            sumBe += kotlin.math.abs(currBe - prevBe)
+        }
+        return minOf(sumLe, sumBe).toDouble() / count < NOISE_LEVEL
     }
 
     fun sample(data: ByteArray, offset: Int, index: Int, bigEndian: Boolean): Int {
@@ -882,12 +941,18 @@ internal class ByteOrderDetector(private val channels: Int) {
     /** 返回 true 表示这一次刚下结论。 */
     fun offer(data: ByteArray, offset: Int, length: Int): Boolean {
         if (order != PcmByteOrder.UNDECIDED) return false
-        val le = PcmProbe.meanAbsDelta(data, offset, length, channels, bigEndian = false)
-        if (le.isNaN()) return false
-        val be = PcmProbe.meanAbsDelta(data, offset, length, channels, bigEndian = true)
-        val count = length / 2 - channels.coerceIn(1, 8)
-        little += le * count
-        big += be * count
+        val stride = channels.coerceIn(1, 8)
+        val samples = length / 2
+        val count = samples - stride
+        if (count < PcmProbe.MIN_DELTAS) return false
+        var sumLe = 0L
+        var sumBe = 0L
+        for (i in stride until samples) {
+            sumLe += kotlin.math.abs(PcmProbe.sample(data, offset, i, false) - PcmProbe.sample(data, offset, i - stride, false))
+            sumBe += kotlin.math.abs(PcmProbe.sample(data, offset, i, true) - PcmProbe.sample(data, offset, i - stride, true))
+        }
+        little += sumLe.toDouble()
+        big += sumBe.toDouble()
         deltas += count
         if (deltas < MIN_DELTAS_TO_DECIDE || maxOf(little, big) == 0.0) return false
         order = when {

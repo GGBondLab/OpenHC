@@ -11,6 +11,8 @@ package io.github.gcbond.openhc.platform.media
  * 送帧、出帧在不同线程，方法都加锁。纯逻辑，不引用安卓类。
  */
 internal class ReplayTracker {
+    @Volatile
+    private var active = false
     private var first = NONE
     private var last = NONE
     private var shown = NONE
@@ -21,6 +23,7 @@ internal class ReplayTracker {
         first = NONE
         last = NONE
         shown = NONE
+        active = false
     }
 
     /** 送进去一个重放帧（时间戳要比之前记的都大）；[isLast] 表示它是重放的最后一帧。 */
@@ -29,11 +32,17 @@ internal class ReplayTracker {
         if (first == NONE) first = ptsUs
         last = ptsUs
         if (isLast) shown = ptsUs
+        active = true
     }
 
     /** 解码器交出一帧：返回 [FRESH]（不是重放的帧）、[REPLAY] 或 [REPLAY_LAST]。 */
+    fun classify(ptsUs: Long): Int {
+        if (!active) return FRESH
+        return classifyLocked(ptsUs)
+    }
+
     @Synchronized
-    fun classify(ptsUs: Long): Int = when {
+    private fun classifyLocked(ptsUs: Long): Int = when {
         first == NONE || ptsUs < first || ptsUs > last -> FRESH
         ptsUs == shown -> REPLAY_LAST
         else -> REPLAY

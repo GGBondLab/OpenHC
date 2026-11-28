@@ -28,16 +28,29 @@ class AudioJitterQueue(
     val trimSpacingMillis: Long = 200,
     val trimStepFrames: Int = 1,
     val startWindowMillis: Long = 0,
+    /** 未达起播门槛但超过这么久没再来新包时直接放行（防短语音/尾音被吞）；0 表示关闭。 */
+    val tailFlushMillis: Long = 0,
+    /** 未起播状态下残留数据静置超过这么久，再来新包时先丢弃陈旧残留防串播；0 表示关闭。 */
+    val staleDiscardMillis: Long = 0,
     private val clockNanos: () -> Long = System::nanoTime,
 ) {
-    class Chunk(val data: ByteArray, val frames: Int)
+    class Chunk(val data: ByteArray, val frames: Int) {
+        internal var length: Int = data.size
+        internal var pooled: Boolean = false
+    }
 
     private val lock = ReentrantLock()
     private val ready = lock.newCondition()
     private val chunks = ArrayDeque<Chunk>()
+    private val bytePool = ArrayDeque<ByteArray>(MAX_POOL_SIZE)
+
+    @Volatile
     private var buffered = 0L
     private var releasing = false
     private var closed = false
+    private var waiters = 0
+
+    @Volatile
     private var dropped = 0L
     private var starved = 0
     private var trimmed = 0L
@@ -47,25 +60,30 @@ class AudioJitterQueue(
     /** 最近一次起播（开始往外放）的时刻；起播窗口过了置 null。 */
     private var releasedAt: Long? = null
 
+    /** 起播窗口内最近一次压回的时刻，防止突发包每 5ms 连续删块造成倍速播放。 */
+    private var lastStartTrim: Long? = null
+
     /** 取走之后仍高于目标是从什么时候开始的；不高于目标时为 null。 */
     private var aboveSince: Long? = null
     private var lastTrim: Long? = null
+    private var lastOfferAt: Long = 0L
 
     init {
         require(startFrames > 0) { "起播门槛必须为正" }
         require(startFrames <= targetFrames && targetFrames <= maxFrames) { "要求 起播门槛 ≤ 目标 ≤ 上限" }
         require(trimHoldMillis >= 0 && trimSpacingMillis >= 0 && startWindowMillis >= 0) { "削峰的时间不能为负" }
+        require(tailFlushMillis >= 0 && staleDiscardMillis >= 0) { "尾包排空与陈旧丢弃时间不能为负" }
         require(trimStepFrames > 0) { "每次削峰的帧数必须为正" }
     }
 
     /** 还没被取走的帧数。 */
-    val bufferedFrames: Long get() = lock.withLock { buffered }
+    val bufferedFrames: Long get() = buffered
 
     /** 已经攒够、正在往外放（false 表示在攒数据）。 */
     val isReleasing: Boolean get() = lock.withLock { releasing }
 
     /** 因为积压丢掉的帧数（累计）。 */
-    val droppedFrames: Long get() = lock.withLock { dropped }
+    val droppedFrames: Long get() = dropped
 
     /** 放空、重新攒数据的次数（累计）。 */
     val starvations: Int get() = lock.withLock { starved }
@@ -86,25 +104,101 @@ class AudioJitterQueue(
         }
     }
 
+    /** 从池里借缓冲复制 `data[offset, offset + length)` 并入队，避免每包分配零填充 ByteArray。 */
+    internal fun offerCopy(data: ByteArray, offset: Int, length: Int, frames: Int): Long {
+        require(offset >= 0 && length > 0 && offset <= data.size - length) { "范围非法" }
+        require(frames > 0) { "帧数必须为正" }
+        val buf = borrowBuffer(length)
+        System.arraycopy(data, offset, buf, 0, length)
+        return offerPooled(buf, length, frames)
+    }
+
+    /** 从池里借缓冲转换 PCM 并入队。不足一帧时什么都不做。 */
+    internal fun offerPcm(data: ByteArray, offset: Int, length: Int, frameBytes: Int, bigEndian: Boolean): Long {
+        require(offset >= 0 && length >= 0 && offset <= data.size - length) { "范围非法" }
+        require(frameBytes > 0 && frameBytes % 2 == 0) { "帧长必须是正的偶数" }
+        val usable = length - length % frameBytes
+        if (usable <= 0) return 0L
+        val buf = borrowBuffer(usable)
+        PcmBytes.copyLittleEndianInto(data, offset, usable, bigEndian, buf)
+        return offerPooled(buf, usable, usable / frameBytes)
+    }
+
+    /** 播放线程用完一块后归还池化缓冲。 */
+    internal fun recycle(chunk: Chunk) {
+        if (!chunk.pooled) return
+        lock.withLock {
+            returnBufferLocked(chunk)
+        }
+    }
+
+    /** 唤醒等待中的播放线程（例如音量变化时立即应用）。 */
+    internal fun wakeup() {
+        lock.withLock {
+            if (waiters > 0) ready.signalAll()
+        }
+    }
+
+    private fun borrowBuffer(minSize: Int): ByteArray {
+        val pooled = lock.withLock {
+            if (closed) null else bytePool.pollLast()
+        }
+        return if (pooled != null && pooled.size >= minSize) {
+            pooled
+        } else {
+            ByteArray(maxOf(minSize, MIN_POOLED_BYTES))
+        }
+    }
+
+    private fun offerPooled(buf: ByteArray, length: Int, frames: Int): Long {
+        val chunk = Chunk(buf, frames).also {
+            it.length = length
+            it.pooled = true
+        }
+        lock.withLock {
+            if (closed) return 0L
+            return add(chunk)
+        }
+    }
+
+    private fun returnBufferLocked(chunk: Chunk) {
+        if (chunk.pooled && !closed && bytePool.size < MAX_POOL_SIZE) {
+            bytePool.addLast(chunk.data)
+        }
+    }
+
     private fun add(chunk: Chunk): Long {
+        val now = clockNanos()
+        var droppedNow = 0L
+        if (!releasing && chunks.isNotEmpty() && staleDiscardMillis > 0 &&
+            now - lastOfferAt >= TimeUnit.MILLISECONDS.toNanos(staleDiscardMillis)
+        ) {
+            droppedNow += buffered
+            dropped += buffered
+            while (chunks.isNotEmpty()) returnBufferLocked(chunks.removeFirst())
+            buffered = 0
+        }
+        val wasEmpty = chunks.isEmpty()
+        lastOfferAt = now
         chunks.addLast(chunk)
         val frames = chunk.frames
         buffered += frames
-        var droppedNow = 0L
         if (buffered > maxFrames) {
             // 从最旧的丢起，至少留下刚放进来的这一块。
             while (buffered > targetFrames && chunks.size > 1) {
                 val old = chunks.removeFirst()
                 buffered -= old.frames
                 droppedNow += old.frames
+                returnBufferLocked(old)
             }
             dropped += droppedNow
         }
         if (!releasing && buffered >= startFrames) {
             releasing = true
-            releasedAt = clockNanos()
+            releasedAt = now
+            lastStartTrim = null
         }
-        if (releasing) ready.signalAll()
+        if (waiters > 0 && (releasing || (wasEmpty && tailFlushMillis > 0))) ready.signalAll()
         return droppedNow
     }
 
@@ -115,7 +209,17 @@ class AudioJitterQueue(
     fun take(timeoutMillis: Long): Chunk? {
         lock.withLock {
             var waitNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis.coerceAtLeast(0))
+            val tailFlushNanos = TimeUnit.MILLISECONDS.toNanos(tailFlushMillis)
             while (!closed) {
+                if (!releasing && chunks.isNotEmpty() && tailFlushNanos > 0) {
+                    val now = clockNanos()
+                    val sinceLastOffer = now - lastOfferAt
+                    if (sinceLastOffer >= tailFlushNanos) {
+                        releasing = true
+                        releasedAt = now
+                        lastStartTrim = null
+                    }
+                }
                 if (releasing && chunks.isNotEmpty()) {
                     trimStartBurst()
                     val chunk = chunks.removeFirst()
@@ -124,7 +228,21 @@ class AudioJitterQueue(
                     return chunk
                 }
                 if (waitNanos <= 0) return null
-                waitNanos = ready.awaitNanos(waitNanos)
+                val stepWait = if (!releasing && chunks.isNotEmpty() && tailFlushNanos > 0) {
+                    val remain = (tailFlushNanos - (clockNanos() - lastOfferAt)).coerceAtLeast(1L)
+                    minOf(waitNanos, remain)
+                } else {
+                    waitNanos
+                }
+                val before = clockNanos()
+                waiters++
+                val left = try {
+                    ready.awaitNanos(stepWait)
+                } finally {
+                    waiters--
+                }
+                val spent = if (stepWait == waitNanos) waitNanos - left.coerceAtLeast(0L) else (clockNanos() - before).coerceAtLeast(1L)
+                waitNanos -= spent
             }
             return null
         }
@@ -136,22 +254,37 @@ class AudioJitterQueue(
             if (!releasing) return
             starved++
             releasing = buffered >= startFrames
+            releasedAt = if (releasing) clockNanos() else null
+            lastStartTrim = null
             aboveSince = null
         }
     }
 
-    /** 起播窗口里：高于目标就从最旧的丢起，丢到不低于目标为止（至少留一块）。只在持锁时调用。 */
+    /**
+     * 起播窗口里：高于目标时一次性从最旧的压回目标（不低于目标，至少留一块）。
+     * 两次压回之间保留至少 [startTrimCooldownNanos] 的冷却时间，避免网络卡顿后 TCP 连续补包时每 5ms 删一块、
+     * 听起来变成 2～4 倍速快进。只在持锁时调用。
+     */
     private fun trimStartBurst() {
         val since = releasedAt ?: return
-        if (clockNanos() - since >= TimeUnit.MILLISECONDS.toNanos(startWindowMillis)) {
+        val now = clockNanos()
+        if (now - since >= TimeUnit.MILLISECONDS.toNanos(startWindowMillis)) {
             releasedAt = null
+            lastStartTrim = null
             return
         }
+        val last = lastStartTrim
+        val cooldownNanos = TimeUnit.MILLISECONDS.toNanos(maxOf(trimSpacingMillis, START_TRIM_COOLDOWN_MILLIS))
+        if (last != null && now - last < cooldownNanos) return
+        var trimmedNow = false
         while (chunks.size > 1 && buffered - chunks.first.frames >= targetFrames) {
             val oldest = chunks.removeFirst()
             buffered -= oldest.frames
             startTrimmed += oldest.frames
+            returnBufferLocked(oldest)
+            trimmedNow = true
         }
+        if (trimmedNow) lastStartTrim = now
     }
 
     /** 取走一块之后：长期高于目标就从最旧的丢起，每次最多约 [trimStepFrames]（至少留一块）。只在持锁时调用。 */
@@ -176,6 +309,7 @@ class AudioJitterQueue(
             trimmed += oldest.frames
             trims++
             droppedNow += oldest.frames
+            returnBufferLocked(oldest)
         }
         lastTrim = now
     }
@@ -185,9 +319,18 @@ class AudioJitterQueue(
         lock.withLock {
             closed = true
             chunks.clear()
+            bytePool.clear()
             buffered = 0
             ready.signalAll()
         }
+    }
+
+    private companion object {
+        const val MAX_POOL_SIZE = 64
+        const val MIN_POOLED_BYTES = 2048
+
+        /** 起播窗口内两次压回的最小冷却间隔，防止突发补包触发连续微切变成倍速快进。 */
+        const val START_TRIM_COOLDOWN_MILLIS = 400L
     }
 }
 
@@ -201,17 +344,24 @@ object PcmBytes {
         require(offset >= 0 && length >= 0 && offset <= data.size - length) { "范围非法" }
         require(frameBytes > 0 && frameBytes % 2 == 0) { "帧长必须是正的偶数" }
         val usable = length - length % frameBytes
+        if (usable == 0) return EMPTY_PCM
         val copy = ByteArray(usable)
+        copyLittleEndianInto(data, offset, usable, bigEndian, copy)
+        return copy
+    }
+
+    internal fun copyLittleEndianInto(data: ByteArray, offset: Int, usable: Int, bigEndian: Boolean, out: ByteArray) {
         if (!bigEndian) {
-            System.arraycopy(data, offset, copy, 0, usable)
-            return copy
+            System.arraycopy(data, offset, out, 0, usable)
+            return
         }
         var i = 0
         while (i < usable) {
-            copy[i] = data[offset + i + 1]
-            copy[i + 1] = data[offset + i]
+            out[i] = data[offset + i + 1]
+            out[i + 1] = data[offset + i]
             i += 2
         }
-        return copy
     }
+
+    private val EMPTY_PCM = ByteArray(0)
 }

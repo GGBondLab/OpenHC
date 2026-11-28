@@ -30,13 +30,23 @@ class TouchMapper(
 ) {
     enum class Action { DOWN, POINTER_DOWN, MOVE, POINTER_UP, UP, CANCEL }
 
-    private class Finger(val id: Int, var x: Float, var y: Float) {
+    private class Finger(val id: Int) {
+        var down = false
+        var x = 0f
+        var y = 0f
+
         /** 是否转给手机。按下时决定，之后不变（中止手势时全部改为忽略）。 */
         var accepted = false
     }
 
     private var viewport: VideoViewport? = null
-    private val fingers = LinkedHashMap<Int, Finger>()
+    private val slots = Array(MAX_POINTER_ID + 1) { Finger(it) }
+    private var acceptedCount = 0
+
+    /** MotionEvent 复用的工作数组（仅单线程调用）。 */
+    internal var scratchIds = IntArray(MAX_POINTS)
+    internal var scratchXs = FloatArray(MAX_POINTS)
+    internal var scratchYs = FloatArray(MAX_POINTS)
 
     /** 手机那边按着的触点：上次发出的 DOWN 或 MOVE 快照（按编号升序）；null 表示没有按着的触点。 */
     private var lastSent: List<HiSightInput.Point>? = null
@@ -47,10 +57,15 @@ class TouchMapper(
      */
     fun setViewport(viewport: VideoViewport?): List<HiSightInput.Touch> {
         if (viewport == this.viewport) return emptyList()
-        val out = ArrayList<HiSightInput.Touch>(1)
-        endGesture(out)
+        var out: ArrayList<HiSightInput.Touch>? = null
+        if (lastSent != null) {
+            out = ArrayList(1)
+            endGesture(out)
+        } else {
+            endGesture(null)
+        }
         this.viewport = viewport
-        return out
+        return out ?: emptyList()
     }
 
     /**
@@ -66,43 +81,48 @@ class TouchMapper(
         ys: FloatArray,
     ): List<HiSightInput.Touch> {
         require(count in 0..minOf(ids.size, xs.size, ys.size)) { "指针个数非法" }
-        val out = ArrayList<HiSightInput.Touch>(1)
+        var out: ArrayList<HiSightInput.Touch>? = null
+        fun sink(): ArrayList<HiSightInput.Touch> = out ?: ArrayList<HiSightInput.Touch>(1).also { out = it }
         when (action) {
             Action.DOWN -> {
                 // 新手势的第一根手指：之前的状态如果没收尾（漏了 UP），先收尾。
-                endGesture(out)
-                fingers.clear()
-                pointerDown(changedId, count, ids, xs, ys, out)
+                if (lastSent != null) endGesture(sink()) else endGesture(null)
+                clearFingers()
+                pointerDown(changedId, count, ids, xs, ys, ::sink)
             }
             Action.POINTER_DOWN -> {
                 updatePositions(count, ids, xs, ys)
-                pointerDown(changedId, count, ids, xs, ys, out)
+                pointerDown(changedId, count, ids, xs, ys, ::sink)
             }
             Action.MOVE -> {
                 updatePositions(count, ids, xs, ys)
-                if (lastSent != null) sendSnapshot(out)
+                if (lastSent != null) sendSnapshot(::sink)
             }
             Action.POINTER_UP -> {
                 updatePositions(count, ids, xs, ys)
-                pointerUp(changedId, out)
+                pointerUp(changedId, ::sink)
             }
             Action.UP -> {
                 updatePositions(count, ids, xs, ys)
-                pointerUp(changedId, out)
+                pointerUp(changedId, ::sink)
                 // 最后一根手指抬起：不管还记着什么都清掉。
-                endGesture(out)
-                fingers.clear()
+                if (lastSent != null) endGesture(sink()) else endGesture(null)
+                clearFingers()
             }
             Action.CANCEL -> {
-                endGesture(out)
-                fingers.clear()
+                if (lastSent != null) endGesture(sink()) else endGesture(null)
+                clearFingers()
             }
         }
-        return out
+        return out ?: emptyList()
     }
 
     /** 中止当前手势（失去焦点、离开窗口）：手机上按着的一组按上次的位置抬起，还按着的手指忽略到抬起为止。 */
     fun cancel(): List<HiSightInput.Touch> {
+        if (lastSent == null) {
+            endGesture(null)
+            return emptyList()
+        }
         val out = ArrayList<HiSightInput.Touch>(1)
         endGesture(out)
         return out
@@ -116,35 +136,51 @@ class TouchMapper(
         endGesture(null)
     }
 
-    private fun pointerDown(
+    private inline fun pointerDown(
         id: Int,
         count: Int,
         ids: IntArray,
         xs: FloatArray,
         ys: FloatArray,
-        out: MutableList<HiSightInput.Touch>,
+        out: () -> MutableList<HiSightInput.Touch>,
     ) {
         val index = indexOf(id, count, ids)
-        if (index < 0) return
-        val finger = Finger(id, xs[index], ys[index])
-        fingers[id] = finger
+        if (index < 0 || id !in 0..MAX_POINTER_ID) return
+        val finger = slots[id]
+        if (finger.accepted) {
+            finger.accepted = false
+            acceptedCount--
+        }
+        finger.down = true
+        finger.x = xs[index]
+        finger.y = ys[index]
         val vp = viewport ?: return
-        if (id !in 0..MAX_POINTER_ID || vp.distanceOutside(finger.x, finger.y) > edgeSlopPx) return
-        if (acceptedCount() >= MAX_POINTS) return
+        if (vp.distanceOutside(finger.x, finger.y) > edgeSlopPx) return
+        if (acceptedCount >= MAX_POINTS) return
         finger.accepted = true
+        acceptedCount++
         // 手机那边没有按着的触点就按下，否则把新手指放进快照里移动。
         sendSnapshot(out)
     }
 
-    private fun pointerUp(id: Int, out: MutableList<HiSightInput.Touch>) {
-        val finger = fingers.remove(id) ?: return
-        if (!finger.accepted || lastSent == null) return
-        if (acceptedCount() > 0) {
+    private inline fun pointerUp(id: Int, out: () -> MutableList<HiSightInput.Touch>) {
+        if (id !in 0..MAX_POINTER_ID) return
+        val finger = slots[id]
+        if (!finger.down) return
+        finger.down = false
+        val wasAccepted = finger.accepted
+        if (wasAccepted) {
+            finger.accepted = false
+            acceptedCount--
+        }
+        if (!wasAccepted || lastSent == null) return
+        if (acceptedCount > 0) {
             // 还有别的手指：快照里少了这根，手机按差集抬起它，其余的继续按着。
             sendSnapshot(out)
         } else {
             // 最后一根：只带它自己抬起，用这次事件里的位置。
-            out += touch(HiSightInput.Touch.Action.UP, points(listOf(finger)))
+            val vp = checkNotNull(viewport)
+            out() += touch(HiSightInput.Touch.Action.UP, listOf(HiSightInput.Point(finger.id, vp.videoX(finger.x), vp.videoY(finger.y))))
             lastSent = null
         }
     }
@@ -154,26 +190,50 @@ class TouchMapper(
         val held = lastSent
         if (held != null && out != null) out += touch(HiSightInput.Touch.Action.UP, listOf(held[0]))
         lastSent = null
-        for (finger in fingers.values) finger.accepted = false
+        if (acceptedCount > 0) {
+            for (finger in slots) finger.accepted = false
+            acceptedCount = 0
+        }
+    }
+
+    private fun clearFingers() {
+        for (finger in slots) {
+            finger.down = false
+            finger.accepted = false
+        }
+        acceptedCount = 0
     }
 
     /** 按当前有效手指发快照：手机那边没按着就发 DOWN，按着时集合或位置变了才发 MOVE。 */
-    private fun sendSnapshot(out: MutableList<HiSightInput.Touch>) {
-        val points = points(fingers.values.filter { it.accepted })
-        if (points.isEmpty()) return
+    private inline fun sendSnapshot(out: () -> MutableList<HiSightInput.Touch>) {
+        if (acceptedCount <= 0) return
+        val vp = viewport ?: return
         val previous = lastSent
+        if (previous != null && previous.size == acceptedCount) {
+            var idx = 0
+            var unchanged = true
+            for (finger in slots) {
+                if (!finger.accepted) continue
+                val p = previous[idx++]
+                if (p.id != finger.id || p.x != vp.videoX(finger.x) || p.y != vp.videoY(finger.y)) {
+                    unchanged = false
+                    break
+                }
+            }
+            if (unchanged) return
+        }
+        val points = ArrayList<HiSightInput.Point>(acceptedCount)
+        for (finger in slots) {
+            if (!finger.accepted) continue
+            points.add(HiSightInput.Point(finger.id, vp.videoX(finger.x), vp.videoY(finger.y)))
+        }
+        if (points.isEmpty()) return
         if (previous == null) {
-            out += touch(HiSightInput.Touch.Action.DOWN, points)
+            out() += touch(HiSightInput.Touch.Action.DOWN, points)
         } else {
-            if (samePoints(previous, points)) return
-            out += touch(HiSightInput.Touch.Action.MOVE, points)
+            out() += touch(HiSightInput.Touch.Action.MOVE, points)
         }
         lastSent = points
-    }
-
-    private fun points(group: List<Finger>): List<HiSightInput.Point> {
-        val vp = viewport ?: return emptyList()
-        return group.sortedBy { it.id }.map { HiSightInput.Point(it.id, vp.videoX(it.x), vp.videoY(it.y)) }
     }
 
     private fun touch(action: HiSightInput.Touch.Action, points: List<HiSightInput.Point>): HiSightInput.Touch {
@@ -183,25 +243,18 @@ class TouchMapper(
 
     private fun updatePositions(count: Int, ids: IntArray, xs: FloatArray, ys: FloatArray) {
         for (i in 0 until count) {
-            val finger = fingers[ids[i]] ?: continue
+            val id = ids[i]
+            if (id !in 0..MAX_POINTER_ID) continue
+            val finger = slots[id]
+            if (!finger.down) continue
             finger.x = xs[i]
             finger.y = ys[i]
         }
     }
 
-    private fun acceptedCount(): Int = fingers.values.count { it.accepted }
-
     private fun indexOf(id: Int, count: Int, ids: IntArray): Int {
         for (i in 0 until count) if (ids[i] == id) return i
         return -1
-    }
-
-    private fun samePoints(a: List<HiSightInput.Point>, b: List<HiSightInput.Point>): Boolean {
-        if (a.size != b.size) return false
-        for (i in a.indices) {
-            if (a[i].id != b[i].id || a[i].x != b[i].x || a[i].y != b[i].y) return false
-        }
-        return true
     }
 
     companion object {

@@ -57,6 +57,10 @@ class AudioTuning(
 
     fun startFrames(sampleRate: Int): Int = framesFor(sampleRate, startMillis + added)
 
+    /** 按用途取起播帧数：导航、提示与通话不叠加无线防扫网垫底 [cushionMillis]，避免首字明显滞后或短提示音攒不够门槛。 */
+    fun startFramesFor(usage: AudioUsage, sampleRate: Int): Int =
+        if (usage == AudioUsage.MEDIA) startFrames(sampleRate) else framesFor(sampleRate, startMillis + extraDelayMillis)
+
     fun targetFrames(sampleRate: Int): Int = framesFor(sampleRate, targetMillis + added)
 
     fun maxFrames(sampleRate: Int): Int = framesFor(sampleRate, maxMillis + added)

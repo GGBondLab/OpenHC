@@ -68,8 +68,9 @@ android {
 
     buildTypes {
         release {
-            // 代码压缩等协议层稳定后再开；开之前要先补齐保留规则。
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release")
         }
     }
@@ -84,10 +85,30 @@ android {
         buildConfig = true
     }
 
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
+    androidResources {
+        // 仅保留中英文资源（本应用界面为中文，裁剪 AndroidX 附带的 70+ 种车机无用语言字符串表）。
+        localeFilters += listOf("zh", "zh-rCN", "zh-rHK", "zh-rTW", "en", "en-rAU", "en-rCA", "en-rGB", "en-rIN")
+    }
+
     packaging {
         resources {
-            // BouncyCastle（core:auth 用）和 jspecify 都带了这份 OSGi 清单，打包时重名；安卓用不到 OSGi 清单。
-            excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
+            // 剔除 BouncyCastle 未使用的后量子查表资源（约 1.2 MB 压缩体积）及无用编译期元数据，保留全架构原生库与协程 SPI。
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/versions/**/OSGI-INF/MANIFEST.MF",
+                "org/bouncycastle/**",
+                "DebugProbesKt.bin",
+                "kotlin-tooling-metadata.json",
+                "kotlin/**/*.kotlin_builtins",
+                "META-INF/*.version",
+                "META-INF/com/android/build/gradle/app-metadata.properties",
+                "META-INF/version-control-info.textproto",
+            )
         }
     }
 }
@@ -106,7 +127,7 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
-    implementation(libs.androidx.compose.ui.tooling.preview)
+    debugImplementation(libs.androidx.compose.ui.tooling.preview)
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.androidx.core.ktx)
 

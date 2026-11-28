@@ -26,6 +26,13 @@ internal class AesCtr(sessionKey: ByteArray) {
     fun seal(random: SecureRandom, plain: ByteArray, offset: Int = 0, length: Int = plain.size - offset): ByteArray =
         cipher.seal(random, plain, offset, length)
 
+    /** 直接把 `IV ‖ 密文` 写入 `dest[destOffset..]`，省去中间数组。 */
+    fun sealInto(
+        random: SecureRandom,
+        plain: ByteArray, plainOffset: Int, length: Int,
+        dest: ByteArray, destOffset: Int,
+    ) = cipher.sealInto(random, plain, plainOffset, length, dest, destOffset)
+
     /** 解密一帧 `IV ‖ 密文`；不足 16 字节（缺完整 IV）抛 [MalformedMessageException]。 */
     fun open(payload: ByteArray, offset: Int = 0, length: Int = payload.size - offset): ByteArray {
         if (length < IV_BYTES) throw MalformedMessageException("加密载荷只有 $length 字节，缺少完整 IV")
@@ -36,6 +43,15 @@ internal class AesCtr(sessionKey: ByteArray) {
     fun transform(iv: ByteArray, input: ByteArray, inOffset: Int, length: Int, output: ByteArray, outOffset: Int) {
         require(iv.size == IV_BYTES) { "IV 必须是 16 字节" }
         cipher.transform(iv, 0, input, inOffset, length, output, outOffset)
+    }
+
+    /** 直接读取 `iv[ivOffset, +16)` 执行 CTR 变换（支持原地加密，省去 IV 拷贝）。 */
+    fun transformWithIvAt(
+        iv: ByteArray, ivOffset: Int,
+        input: ByteArray, inOffset: Int, length: Int,
+        output: ByteArray, outOffset: Int,
+    ) {
+        cipher.transform(iv, ivOffset, input, inOffset, length, output, outOffset)
     }
 
     override fun toString(): String = "AesCtr(密钥不显示)"

@@ -152,6 +152,9 @@ class ProjectionView @JvmOverloads constructor(
     // 触摸原样转给手机，本地没有点击动作，无障碍的 performClick 没有意义。
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            requestUnbufferedDispatch(event)
+        }
         deliver(touchMapper.onMotionEvent(event))
         return true
     }

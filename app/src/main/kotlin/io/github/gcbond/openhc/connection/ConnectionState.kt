@@ -1,5 +1,6 @@
 package io.github.gcbond.openhc.connection
 
+import androidx.compose.runtime.Immutable
 import io.github.gcbond.openhc.core.auth.AuthMode
 import io.github.gcbond.openhc.core.session.EndReason
 import io.github.gcbond.openhc.core.session.SessionEvent
@@ -72,6 +73,7 @@ enum class Step {
 }
 
 /** 手机选定的投屏参数。 */
+@Immutable
 data class VideoInfo(val width: Int, val height: Int, val fps: Int, val touchInput: Boolean) {
     companion object {
         fun of(video: VideoParameters) = VideoInfo(video.width, video.height, video.fps, video.touchInput)
@@ -174,6 +176,7 @@ sealed class ConnectionSignal {
 }
 
 /** 界面看的连接状态。 */
+@Immutable
 data class ConnectionUiState(
     val phase: Phase = Phase.IDLE,
     val step: Step? = null,

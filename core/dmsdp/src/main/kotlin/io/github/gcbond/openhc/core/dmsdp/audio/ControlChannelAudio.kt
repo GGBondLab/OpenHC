@@ -59,12 +59,23 @@ internal class ControlChannelAudio {
     private class Assembly {
         var sequence = -1L
         var count = 0
-        val buffer = java.io.ByteArrayOutputStream()
+        var buf = ByteArray(INITIAL_GROUP_BYTES)
+        var size = 0
+
+        fun append(src: ByteArray, offset: Int, length: Int) {
+            if (size + length > buf.size) {
+                var cap = buf.size
+                while (cap < size + length) cap *= 2
+                buf = buf.copyOf(cap)
+            }
+            System.arraycopy(src, offset, buf, size, length)
+            size += length
+        }
 
         fun reset() {
             sequence = -1
             count = 0
-            buffer.reset()
+            size = 0
         }
     }
 
@@ -106,18 +117,19 @@ internal class ControlChannelAudio {
             a.reset()
             return true
         }
-        a.buffer.write(payload, HEADER, length)
-        a.count++
-        if (a.count > MAX_FRAGMENTS || a.buffer.size() > MAX_GROUP_BYTES) {
+        if (a.count + 1 > MAX_FRAGMENTS || a.size + length > MAX_GROUP_BYTES) {
             dropped++
             a.reset()
             return true
         }
+        a.append(payload, HEADER, length)
+        a.count++
         if (position != LAST) return true
-        val whole = a.buffer.toByteArray()
+        val whole = a.buf
+        val wholeSize = a.size
         a.reset()
-        val header = GROUP_HEADERS.firstOrNull { it < whole.size && u32(whole, it - 4) == whole.size.toLong() }
-        val pcm = if (header == null) 0 else whole.size - header
+        val header = GROUP_HEADERS.firstOrNull { it < wholeSize && u32(whole, it - 4) == wholeSize.toLong() }
+        val pcm = if (header == null) 0 else wholeSize - header
         if (header == null || pcm % 2 != 0 || (whole[0].toInt() and 0xFF) != service) {
             dropped++
             return true
@@ -163,6 +175,7 @@ internal class ControlChannelAudio {
         /** 一组最多几片、最多多少字节（实机一组 3 片约 4 KB、6 片约 8 KB）。 */
         const val MAX_FRAGMENTS = 32
         const val MAX_GROUP_BYTES = 64 * 1024
+        private const val INITIAL_GROUP_BYTES = 8 * 1024
 
         /** 同时拼的声音最多几路。 */
         const val MAX_STREAMS = 4

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- 极简深色石墨横幅底 -->
+    <path
+        android:fillColor="#12141A"
+        android:pathData="M0,0h320v180h-320z" />
+    <!-- 品牌蓝圆角徽标 -->
+    <path
+        android:fillColor="#0A84FF"
+        android:pathData="M58,52h76a18,18 0,0 1,18 18v40a18,18 0,0 1,-18 18h-76a18,18 0,0 1,-18 -18v-40a18,18 0,0 1,18 -18z" />
+    <!-- 投屏大屏 + 手机互联图标 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M56,74h48a4,4 0,0 1,4 4v24a4,4 0,0 1,-4 4h-48a4,4 0,0 1,-4 -4v-24a4,4 0,0 1,4 -4z" />
+    <path
+        android:fillColor="#CFE6FF"
+        android:pathData="M116,66h18a4,4 0,0 1,4 4v40a4,4 0,0 1,-4 4h-18a4,4 0,0 1,-4 -4v-40a4,4 0,0 1,4 -4z" />
+    <!-- 右侧极简几何装饰条 -->
+    <path
+        android:fillColor="#F3F4F6"
+        android:pathData="M174,72h94a6,6 0,0 1,0 12h-94a6,6 0,0 1,0 -12z" />
+    <path
+        android:fillColor="#6F7685"
+        android:pathData="M174,98h64a5,5 0,0 1,0 10h-64a5,5 0,0 1,0 -10z" />
+</vector>

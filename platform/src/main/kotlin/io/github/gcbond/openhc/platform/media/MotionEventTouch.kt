@@ -20,24 +20,34 @@ fun TouchMapper.onMotionEvent(event: MotionEvent): List<HiSightInput.Touch> {
         else -> return emptyList()
     }
     val count = event.pointerCount
-    val ids = IntArray(count) { event.getPointerId(it) }
-    val xs = FloatArray(count)
-    val ys = FloatArray(count)
-    if (action == TouchMapper.Action.MOVE && event.historySize > 0) {
-        val out = ArrayList<HiSightInput.Touch>()
-        for (h in 0 until event.historySize) {
+    if (scratchIds.size < count) {
+        scratchIds = IntArray(count)
+        scratchXs = FloatArray(count)
+        scratchYs = FloatArray(count)
+    }
+    val ids = scratchIds
+    val xs = scratchXs
+    val ys = scratchYs
+    for (i in 0 until count) ids[i] = event.getPointerId(i)
+    val historySize = event.historySize
+    if (action == TouchMapper.Action.MOVE && historySize > 0) {
+        var out: ArrayList<HiSightInput.Touch>? = null
+        for (h in 0 until historySize) {
             for (i in 0 until count) {
                 xs[i] = event.getHistoricalX(i, h)
                 ys[i] = event.getHistoricalY(i, h)
             }
-            out += onEvent(action, -1, count, ids, xs, ys)
+            val step = onEvent(action, -1, count, ids, xs, ys)
+            if (step.isNotEmpty()) (out ?: ArrayList<HiSightInput.Touch>(4).also { out = it }).addAll(step)
         }
         for (i in 0 until count) {
             xs[i] = event.getX(i)
             ys[i] = event.getY(i)
         }
-        out += onEvent(action, -1, count, ids, xs, ys)
-        return out
+        val last = onEvent(action, -1, count, ids, xs, ys)
+        if (out == null) return last
+        if (last.isNotEmpty()) out!!.addAll(last)
+        return out!!
     }
     for (i in 0 until count) {
         xs[i] = event.getX(i)

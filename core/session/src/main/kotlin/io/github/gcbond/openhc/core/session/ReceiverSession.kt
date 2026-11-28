@@ -83,10 +83,12 @@ class ReceiverSession internal constructor(
     }
 
     private class Out {
-        val list = ArrayList<SessionOutput>(4)
+        private var items: ArrayList<SessionOutput>? = null
+        val list: List<SessionOutput> get() = items ?: emptyList()
 
         fun add(output: SessionOutput) {
-            list += output
+            val target = items ?: ArrayList<SessionOutput>(4).also { items = it }
+            target += output
         }
     }
 
@@ -405,6 +407,14 @@ class ReceiverSession internal constructor(
         if (ended || hisightEnded) return emptyList()
         val hs = hisight ?: return emptyList()
         val outputs = hs.sendInput(input)
+        if (outputs.isEmpty()) return emptyList()
+        if (outputs.size == 1) {
+            val single = outputs[0]
+            if (single is HiSightOutput.Send) {
+                val ep = hisightEndpoint(single.channel)
+                return if (ep != null && ep.state == State.OPEN) listOf(SessionAction.Write(ep.id, single.bytes)) else emptyList()
+            }
+        }
         val out = Out()
         for (o in outputs) if (o is HiSightOutput.Send) write(hisightEndpoint(o.channel), o.bytes, out)
         return out.list
@@ -422,7 +432,7 @@ class ReceiverSession internal constructor(
         val out = Out()
         try {
             handleDmsdp(layer.sendMicAudio(data, offset, length, nowMillis), out)
-        } catch (e: RuntimeException) {
+        } catch (e: Exception) {
             diag(SessionLayer.DMSDP, "麦克风送声音出错（${describe(e)}），已忽略", out)
         }
         return out.list
@@ -930,6 +940,7 @@ class ReceiverSession internal constructor(
     private fun close(ep: Endpoint?, out: Out) {
         if (ep == null || ep.state == State.CLOSED) return
         ep.state = State.CLOSED
+        endpoints.remove(ep.id)
         out.add(SessionAction.Close(ep.id))
     }
 

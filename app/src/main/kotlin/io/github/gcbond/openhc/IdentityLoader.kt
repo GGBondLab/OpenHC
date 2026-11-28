@@ -1,6 +1,7 @@
 package io.github.gcbond.openhc
 
 import android.content.Context
+import androidx.compose.runtime.Immutable
 import io.github.gcbond.openhc.core.common.identity.IdentityAssets
 import io.github.gcbond.openhc.identity.IdentityJson
 import io.github.gcbond.openhc.identity.IdentityResolution
@@ -14,6 +15,7 @@ import java.io.IOException
  */
 object IdentityLoader {
 
+    @Immutable
     sealed interface Result {
         class Loaded(val assets: IdentityAssets) : Result
         object Missing : Result
@@ -22,7 +24,14 @@ object IdentityLoader {
         class Invalid(val reason: String) : Result
     }
 
-    fun load(context: Context): Result = IdentityResolution.resolve(readBundled(context))
+    @Volatile
+    private var cached: Result? = null
+
+    fun load(context: Context): Result {
+        cached?.let { return it }
+        val app = context.applicationContext ?: context
+        return IdentityResolution.resolve(readBundled(app)).also { cached = it }
+    }
 
     private fun readBundled(context: Context): StoredText = try {
         context.assets.open(IdentityAssets.ASSET_FILE_NAME).use { StoredText.Present(IdentityJson.decodeUtf8(IdentityJson.readLimited(it))) }

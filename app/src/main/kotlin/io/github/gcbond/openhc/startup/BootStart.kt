@@ -57,16 +57,16 @@ internal object BootStart {
     fun launchIntent(context: Context): Intent =
         Intent(context, MainActivity::class.java)
             .setAction(BootStartPolicy.ACTION_BOOT_LAUNCH)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
 
     fun isBootLaunch(intent: Intent?): Boolean = intent != null &&
         BootStartPolicy.isBootLaunch(intent.action, intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0)
 
-    /** 开机静默连接把界面带到前台用的 Intent：界面已经在了就带到前台（singleTop，经 onNewIntent），不开始任何连接。 */
+    /** 开机静默连接或被车机桌面盖住时把界面带到前台用的 Intent：界面已经在了就提到前台，不重触发开始流程。 */
     fun surfaceIntent(context: Context): Intent =
         Intent(context, MainActivity::class.java)
             .setAction(BootStartPolicy.ACTION_SHOW_PROJECTION)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
 
     /**
      * 「开机静默连接」这项功能放不放出来。还没在车上验证过，暂时收起：设置页不显示，以前打开过的也按关处理
@@ -132,24 +132,33 @@ internal object BootStart {
     fun appDetailsIntent(context: Context): Intent =
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", context.packageName, null))
 
+    @Volatile
+    private var bydAutostartSupported: Boolean? = null
+
+    @Volatile
+    private var cachedInstalledAt: Long = -1L
+
     /**
      * 比亚迪车机的「选择禁止后台启动项」对话框：开关开着的应用收不到开机广播、蓝牙连上的广播（没在运行时），
      * 车主要把本应用的开关关掉才放行；比亚迪每次更新安装应用都会把它重新打开。没有这个对话框的车机返回 null。
      */
     fun bydAutostartIntent(context: Context): Intent? {
         val intent = Intent(ACTION_BYD_APP_START_MANAGEMENT)
-        val pm = context.packageManager
-        val found = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.resolveActivity(intent, PackageManager.ResolveInfoFlags.of(0))
-            } else {
-                @Suppress("DEPRECATION")
-                pm.resolveActivity(intent, 0)
+        val supported = bydAutostartSupported ?: run {
+            val pm = context.packageManager
+            val found = try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pm.resolveActivity(intent, PackageManager.ResolveInfoFlags.of(0))
+                } else {
+                    @Suppress("DEPRECATION")
+                    pm.resolveActivity(intent, 0)
+                }
+            } catch (e: RuntimeException) {
+                null
             }
-        } catch (e: RuntimeException) {
-            null
+            (found != null).also { bydAutostartSupported = it }
         }
-        return if (found != null) intent else null
+        return if (supported) intent else null
     }
 
     fun lastRecord(context: Context): BootRecord? = BootRecord.decode(prefs(context).getString(KEY_LAST_BOOT, null))
@@ -159,17 +168,21 @@ internal object BootStart {
     }
 
     /** 本次安装或更新的时间（墙上时间，毫秒，安装那一刻记下的，之后不变）；读不到返回 0。 */
-    fun installedAtMillis(context: Context): Long = try {
-        val pm = context.packageManager
-        val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(context.packageName, 0)
+    fun installedAtMillis(context: Context): Long {
+        val known = cachedInstalledAt
+        if (known >= 0L) return known
+        return try {
+            val pm = context.packageManager
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(0))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(context.packageName, 0)
+            }
+            info.lastUpdateTime.also { cachedInstalledAt = it }
+        } catch (e: PackageManager.NameNotFoundException) {
+            0L
         }
-        info.lastUpdateTime
-    } catch (e: PackageManager.NameNotFoundException) {
-        0L
     }
 
     private fun receiver(context: Context) = ComponentName(context, BootStartReceiver::class.java)

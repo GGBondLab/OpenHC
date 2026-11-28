@@ -9,13 +9,18 @@ import io.github.gcbond.openhc.core.common.MalformedMessageException
  * 头部之后一个空行，再接正文。正文长度以控制帧长度为准；`Content-Length` 原样留在 [headers] 里，
  * 由具体消息的处理方校验。
  */
-class DmsdpMessage(
+class DmsdpMessage private constructor(
     val startLine: String,
     /** 头部，保持收到的顺序；名称保留原大小写，名称和值都已去掉首尾空白。可能有重名。 */
     val headers: List<Pair<String, String>>,
-    body: ByteArray,
+    private val bodyBytes: ByteArray,
+    @Suppress("UNUSED_PARAMETER") trusted: Boolean,
 ) {
-    private val bodyBytes = body.copyOf()
+    constructor(
+        startLine: String,
+        headers: List<Pair<String, String>>,
+        body: ByteArray,
+    ) : this(startLine, headers, if (body.isEmpty()) EMPTY_BODY else body.copyOf(), true)
 
     val body: ByteArray get() = bodyBytes.copyOf()
 
@@ -48,6 +53,8 @@ class DmsdpMessage(
         private const val CR = '\r'.code.toByte()
         private const val LF = '\n'.code.toByte()
 
+        private val EMPTY_BODY = ByteArray(0)
+
         /**
          * 拆一条文本消息：头部区必须是 ASCII，每个头部行都要有冒号。头部结束认第一个 CRLFCRLF；没有时依次认
          * LFLF（含 CRLF 之后直接 LF）、整条以换行结尾（只有头部、没有正文）、整条没有换行（只有首行）。
@@ -67,7 +74,8 @@ class DmsdpMessage(
                 if (colon < 0) throw MalformedMessageException("控制消息头部第 $k 行缺少冒号")
                 headers += line.substring(0, colon).trimControl() to line.substring(colon + 1).trimControl()
             }
-            return DmsdpMessage(lines[0], headers, payload.copyOfRange(bodyStart, payload.size))
+            val bodySlice = if (bodyStart >= payload.size) EMPTY_BODY else payload.copyOfRange(bodyStart, payload.size)
+            return DmsdpMessage(lines[0], headers, bodySlice, true)
         }
 
         /** 头部区的结束位置和正文起点。 */
@@ -93,7 +101,8 @@ class DmsdpMessage(
         fun looksLikeText(payload: ByteArray): Boolean {
             var end = 0
             while (end < payload.size && payload[end] != CR && payload[end] != LF) {
-                if (payload[end] !in PRINTABLE) return false
+                val b = payload[end].toInt() and 0xFF
+                if (b < 0x20 || b > 0x7E) return false
                 end++
             }
             if (end == 0) return false
@@ -103,8 +112,6 @@ class DmsdpMessage(
             return tokens.size >= 3 && tokens[0].isNotEmpty() && tokens[0].all { it in 'A'..'Z' || it == '_' } &&
                 tokens.last().startsWith(VERSION_PREFIX)
         }
-
-        private val PRINTABLE = 0x20.toByte()..0x7E.toByte()
 
         /** 编码一条消息：首行、头部各占一行（CRLF），再一个空行，再正文。 */
         fun encode(startLine: String, headers: List<Pair<String, String>>, body: ByteArray = ByteArray(0)): ByteArray {
@@ -129,7 +136,18 @@ class DmsdpMessage(
 
 /** 名称不区分大小写时是否有重名头部。 */
 internal fun DmsdpMessage.hasDuplicateHeaders(): Boolean {
-    val seen = HashSet<String>()
+    val n = headers.size
+    if (n <= 1) return false
+    if (n <= 8) {
+        for (i in 0 until n) {
+            val a = headers[i].first
+            for (j in i + 1 until n) {
+                if (a.equals(headers[j].first, ignoreCase = true)) return true
+            }
+        }
+        return false
+    }
+    val seen = HashSet<String>(n * 2)
     for ((name, _) in headers) {
         if (!seen.add(name.lowercase())) return true
     }

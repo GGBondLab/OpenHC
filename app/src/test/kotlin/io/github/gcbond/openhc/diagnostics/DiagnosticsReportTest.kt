@@ -100,4 +100,40 @@ class DiagnosticsReportTest {
     fun sectionTitlesStandOut() {
         assertEquals("\n===== 运行日志 =====\n", DiagnosticsReport.section("运行日志"))
     }
+
+    @Test
+    fun classifyLineRecognizesWarningsErrorsAndMarkers() {
+        assertEquals(
+            DiagnosticsReport.LineKind.NORMAL,
+            DiagnosticsReport.classifyLine("01-02 03:04:05.678  4321  4400 I OpenHC-Wireless: [1] 开始"),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.NORMAL,
+            DiagnosticsReport.classifyLine("01-02 03:04:05.678  4321  4400 D BluetoothSocket: close()"),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.WARN,
+            DiagnosticsReport.classifyLine("01-02 03:04:05.678  4321  4400 W OpenHC-Wireless: 超时重试"),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.WARN,
+            DiagnosticsReport.classifyLine("01-02 03:04:05.678    12 34567 E OpenHC-Audio: 断了"),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.WARN,
+            DiagnosticsReport.classifyLine("01-02 03:04:05.678  4321  4400 F libc    : Fatal signal 11"),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.MARKER,
+            DiagnosticsReport.classifyLine("===== 01-02 03:04:05.678 OpenHC 诊断记录：进程 4321 开始记录 ====="),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.WARN,
+            DiagnosticsReport.classifyLine("===== 01-02 03:04:05.678 OpenHC 诊断记录：写文件跟不上，丢了 8 行日志 ====="),
+        )
+        assertEquals(
+            DiagnosticsReport.LineKind.NORMAL,
+            DiagnosticsReport.classifyLine("--------- beginning of main"),
+        )
+    }
 }

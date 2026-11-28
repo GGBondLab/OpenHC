@@ -39,6 +39,7 @@ class RfcommServer(
 
     /** 待写的数据（ByteArray）和关闭标记 [CLOSE]，写线程按顺序处理。 */
     private val writes = LinkedBlockingQueue<Any>()
+    private val writeDone = java.util.concurrent.CountDownLatch(1)
 
     @Volatile
     private var lastWriteAt = 0L
@@ -73,9 +74,17 @@ class RfcommServer(
             socket
         } ?: return // 还没接受连接：之后接受到的直接关掉。
         writes.add(CLOSE)
-        // 对端不收、写被卡住时兜底：到时间直接关，卡住的写随之出错。
-        daemon("$threadName-close") {
-            sleepQuietly(FLUSH_LIMIT_MS)
+        // 写线程正常排空退出就立即收工；只有对端不收导致写卡死时才等满上限强制关 socket。
+        if (writeDone.count > 0) {
+            daemon("$threadName-close") {
+                try {
+                    writeDone.await(FLUSH_LIMIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                closeQuietly(client)
+            }
+        } else {
             closeQuietly(client)
         }
     }
@@ -105,6 +114,7 @@ class RfcommServer(
         val client = try {
             opened.accept()
         } catch (e: IOException) {
+            closeQuietly(opened)
             if (!isListenerClosed()) events.onListenFailed("等连接时出错：${describe(e)}")
             return
         }
@@ -139,6 +149,8 @@ class RfcommServer(
             if (isConnectionClosed()) return
             // 对端关闭时安卓的蓝牙 socket 不返回 -1，而是抛出带「read return: -1」的异常。
             if (e.message?.contains(PEER_CLOSED_TEXT) == true) events.onClosed() else events.onConnectionError("读失败：${describe(e)}")
+        } finally {
+            writes.add(CLOSE)
         }
     }
 
@@ -161,8 +173,10 @@ class RfcommServer(
             if (!isConnectionClosed()) events.onConnectionError("写失败：${describe(e)}")
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
+        } finally {
+            closeQuietly(client)
+            writeDone.countDown()
         }
-        closeQuietly(client)
     }
 
     // ---------------------------------------------------------------- 工具

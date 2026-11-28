@@ -56,8 +56,10 @@ internal class AudioOutput(
     /** 抓包到第一次有音频回调时才建（没声明扬声器、手机没要声音的连接不用开线程和文件）。 */
     private var capture: AudioCapture? = null
 
-    /** 一路一个播放器：键是（数据会话、SSRC、通道）。 */
+    /** 一路一个播放器：键是（数据会话、SSRC、通道）；双槽最近使用缓存避免每包分配 StreamKey 和查表。 */
     private val streams = LinkedHashMap<StreamKey, Stream>()
+    private var fastStream0: Stream? = null
+    private var fastStream1: Stream? = null
     private val unsupportedSessions = HashSet<String>()
 
     /** 焦点决定的各用途音量（新建的播放器也照这个设）。 */
@@ -159,25 +161,37 @@ internal class AudioOutput(
     }
 
     override fun onAudioPacket(packet: AudioPacket) {
-        val stale = ArrayList<Stream>(0)
-        try {
-            deliver(packet, stale)
-        } finally {
-            for (stream in stale) stream.finish()
-        }
+        val (stale, statsLine) = deliver(packet)
+        statsLine?.let { Log.i(TAG, it) }
+        stale?.finish()
     }
 
-    /** 在 [lock] 里找到（或建好）这一路、送进播放器；要关掉的旧播放器放进 [stale]，由调用方出锁之后关。 */
-    private fun deliver(packet: AudioPacket, stale: MutableList<Stream>) {
+    /** 在 [lock] 里找到（或建好）这一路、送进播放器；若有被替换的旧播放器或统计日志，返回给调用方在锁外处理。 */
+    private fun deliver(packet: AudioPacket): Pair<Stream?, String?> {
+        var replaced: Stream? = null
+        var statsLine: String? = null
         synchronized(lock) {
-            if (closed) return
+            if (closed) return null to null
             if (!packet.playable) {
                 muted++
                 if (muted == 1L) Log.w(TAG, "[$attemptId] 载荷不像声音（多半还有一层没解开），静音不放；看分帧识别的日志和抓包")
-                return
+                return null to null
             }
-            val stream = streamFor(packet, stale) ?: return
-            if (packet.stream.dataSessionId.startsWith(AudioStreamInfo.CONTROL_SESSION_ID)) lastControlAudioAt = SystemClock.elapsedRealtime()
+            val info = packet.stream
+            val expectedEncoding = encodingOf(packet.codec)
+            var stream = matchFastStream(info.dataSessionId, packet.lane, packet.route)
+            if (stream != null && stream.player.format.encoding != expectedEncoding) {
+                streams.remove(stream.key)
+                clearFastStream(stream)
+                replaced = stream
+                stream = null
+            }
+            if (stream == null) {
+                val created = streamFor(packet, expectedEncoding) { old -> replaced = old }
+                if (created == null) return replaced to null
+                stream = created
+            }
+            if (info.dataSessionId.startsWith(AudioStreamInfo.CONTROL_SESSION_ID)) lastControlAudioAt = SystemClock.elapsedRealtime()
             val target = stream.player
             when (packet.codec) {
                 AudioCodec.PCM -> target.queuePcm(
@@ -188,13 +202,12 @@ internal class AudioOutput(
             stream.packets++
             if (stream.packets % STATS_EVERY == 0L) {
                 val underruns = target.trackUnderruns?.let { "，音轨欠载 $it 次" } ?: ""
-                Log.i(
-                    TAG,
+                statsLine =
                     "[$attemptId] ${stream.label()}已送进播放器 ${stream.packets} 包（静音 $muted）；${target.latency ?: "延迟还没测到"}；" +
-                        "起播压回丢 ${target.startTrimmedMillis}ms，削峰丢 ${target.trimmedMillis}ms（${target.trimmedChunks} 块），" +
-                        "突发超限丢 ${target.droppedMillis}ms，放空 ${target.starvations} 次$underruns",
-                )
+                    "起播压回丢 ${target.startTrimmedMillis}ms，削峰丢 ${target.trimmedMillis}ms（${target.trimmedChunks} 块），" +
+                    "突发超限丢 ${target.droppedMillis}ms，放空 ${target.starvations} 次$underruns"
             }
+            return replaced to statsLine
         }
     }
 
@@ -203,6 +216,8 @@ internal class AudioOutput(
         val all = synchronized(lock) {
             if (closed) return
             closed = true
+            fastStream0 = null
+            fastStream1 = null
             streams.values.toList().also { streams.clear() }
         }
         for (stream in all) stream.finish()
@@ -268,10 +283,10 @@ internal class AudioOutput(
         when (message.action) {
             PhoneAudioFocus.Action.REQUEST ->
                 controller.phoneRequested(usage, AudioFocusPolicy.Gain.ofPhoneFocusType(message.focusType))
-            PhoneAudioFocus.Action.ABANDON ->
-                if (message.split || usage != AudioUsage.MEDIA || route == null || route == AudioRoute.MEDIA) {
-                    controller.phoneAbandoned(usage)
-                }
+            PhoneAudioFocus.Action.ABANDON -> {
+                val transientOnly = !message.split && usage == AudioUsage.MEDIA && route != null && route != AudioRoute.MEDIA
+                controller.phoneAbandoned(usage, transientOnly = transientOnly)
+            }
             PhoneAudioFocus.Action.ABANDON_ALL -> controller.phoneAbandonedAll()
             PhoneAudioFocus.Action.POLICY, PhoneAudioFocus.Action.OTHER -> Unit
         }
@@ -288,20 +303,52 @@ internal class AudioOutput(
         Log.i(TAG, "[$attemptId] $phone：${event.verdict.label}；$outcome")
     }
 
+    private fun matchFastStream(sessionId: String, lane: Long, route: AudioRoute): Stream? {
+        val s0 = fastStream0
+        if (s0 != null && s0.key.lane == lane && s0.key.route === route && s0.key.dataSessionId == sessionId) {
+            return s0
+        }
+        val s1 = fastStream1
+        if (s1 != null && s1.key.lane == lane && s1.key.route === route && s1.key.dataSessionId == sessionId) {
+            fastStream1 = s0
+            fastStream0 = s1
+            return s1
+        }
+        return null
+    }
+
+    private fun promoteFastStream(stream: Stream) {
+        if (fastStream0 === stream) return
+        fastStream1 = fastStream0
+        fastStream0 = stream
+    }
+
+    private fun clearFastStream(stream: Stream) {
+        if (fastStream0 === stream) fastStream0 = null
+        if (fastStream1 === stream) fastStream1 = null
+    }
+
     /**
      * 这一路的播放器：没有就建（格式取自数据会话，编码按载荷判断）。放不了的数据会话返回 null。
-     * 编码变了的旧播放器从表里拿掉、放进 [stale]（持有 [lock] 时不关它）。
+     * 编码变了的旧播放器从表里拿掉并经 [onReplaced] 交给调用方在锁外关闭。
      */
-    private fun streamFor(packet: AudioPacket, stale: MutableList<Stream>): Stream? {
+    private inline fun streamFor(
+        packet: AudioPacket,
+        encoding: AudioPlayer.Encoding,
+        onReplaced: (Stream) -> Unit,
+    ): Stream? {
         val info = packet.stream
         val key = StreamKey(info.dataSessionId, packet.lane, packet.route)
         streams[key]?.let { existing ->
-            if (existing.player.format.encoding == encodingOf(packet.codec)) return existing
+            if (existing.player.format.encoding == encoding) {
+                promoteFastStream(existing)
+                return existing
+            }
             streams.remove(key)
-            stale += existing
+            clearFastStream(existing)
+            onReplaced(existing)
         }
         if (info.dataSessionId in unsupportedSessions) return null
-        val encoding = encodingOf(packet.codec)
         if (encoding == AudioPlayer.Encoding.PCM_16 && info.bitsPerSample != 16) {
             return unsupported(info, "只支持 16 位 PCM，手机给的是 ${info.bitsPerSample} 位")
         }
@@ -316,6 +363,7 @@ internal class AudioOutput(
         stream.player = AudioPlayer(format, stream, if (cushioned) tuning.withCushion(WIRELESS_CUSHION_MILLIS) else tuning, usage)
         volumes[usage]?.let { stream.player.setVolume(it) }
         streams[key] = stream
+        promoteFastStream(stream)
         Log.i(
             TAG,
             "[$attemptId] 建播放器：${stream.label()}，$format，音轨用途 ${usage.label}" +
@@ -333,7 +381,10 @@ internal class AudioOutput(
     private fun stopSession(dataSessionId: String, why: String) {
         val stopped = synchronized(lock) {
             val gone = streams.values.filter { it.key.dataSessionId == dataSessionId }
-            for (stream in gone) streams.remove(stream.key)
+            for (stream in gone) {
+                streams.remove(stream.key)
+                clearFastStream(stream)
+            }
             gone
         }
         for (stream in stopped) {

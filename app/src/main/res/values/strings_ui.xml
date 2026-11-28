@@ -36,4 +36,40 @@
     <string name="settings_clarity_high_short">高</string>
     <string name="settings_clarity_highest_short">最高</string>
     <string name="settings_bt_value_missing">未取到</string>
+
+    <!-- 现代座舱 UI：首页状态胶囊、双栏概览、连接步骤、扫码指引与设置分区说明 -->
+    <string name="home_badge_projecting">投屏中</string>
+    <string name="home_badge_connecting">连接中</string>
+    <string name="home_badge_scanning">等待扫码</string>
+    <string name="home_badge_ready">自动回连就绪</string>
+    <string name="home_badge_attention">待处理</string>
+    <string name="home_badge_wired_only">仅数据线</string>
+    <string name="home_badge_idle">待连接</string>
+    <string name="home_hero_subtitle_both">支持华为 / 荣耀手机无线互联或插线即连，优先响应有线连接</string>
+    <string name="home_hero_subtitle_wired">当前仅启用有线模式，使用数据线接入车机 USB 口即可投屏</string>
+    <string name="home_card_wireless_title">无线互联</string>
+    <string name="home_card_wired_title">有线互联</string>
+    <string name="home_card_badge_auto_on">自动回连</string>
+    <string name="home_card_badge_auto_off">手动连接</string>
+    <string name="home_card_badge_plugged">已检测到手机</string>
+    <string name="home_card_badge_plug_ready">插线优先</string>
+    <string name="home_card_known_phones">已记住 %1$d 台常用手机</string>
+    <string name="home_card_no_known_phones">首次扫码连成功后支持自动回连</string>
+    <string name="home_chip_picture">画面 · %1$s</string>
+    <string name="home_chip_scale">缩放 %1$d%%</string>
+    <string name="home_chip_audio">音频 · %1$s</string>
+    <string name="home_chip_boot_on">开机自启 · 开</string>
+    <string name="home_chip_boot_off">开机自启 · 关</string>
+    <string name="home_step_handshake">握手认证</string>
+    <string name="home_step_channel">建立通道</string>
+    <string name="home_step_projection">准备投屏</string>
+    <string name="home_scan_step1">打开手机「智慧出行 / HiCar」扫码或点击弹窗</string>
+    <string name="home_scan_step2">首次配对请在手机端确认并核对左侧连接码</string>
+    <string name="home_scan_step3">也可直接插入 USB 数据线，自动切换有线连接</string>
+    <string name="settings_subtitle_picture">清晰度、帧率、全屏显示与投屏界面缩放</string>
+    <string name="settings_subtitle_connection">无线网络方式、蓝牙地址与数据线优先策略</string>
+    <string name="settings_subtitle_startup">车机开机自启、后台放行与自动回连设置</string>
+    <string name="settings_subtitle_audio">车机扬声器传输编码、声道分流与麦克风</string>
+    <string name="settings_subtitle_keys">方向盘按键与媒体控制映射</string>
+    <string name="settings_subtitle_diagnostics">导出诊断报告与查看车机实时运行日志</string>
 </resources>

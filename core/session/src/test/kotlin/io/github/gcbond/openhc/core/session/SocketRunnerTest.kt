@@ -414,6 +414,74 @@ class SocketRunnerTest {
         assertTrue(runner.isTerminated)
     }
 
+    @Test
+    fun audioAndTasksPreemptQueuedVideoBurstsWhilePreservingChannelFifo() {
+        val session = ScriptedSession()
+        val videoPort = Box<Int>()
+        val audioPort = Box<Int>()
+        val firstVideoEntered = CountDownLatch(1)
+        val allowFirstVideoFinish = CountDownLatch(1)
+        val allProcessed = CountDownLatch(5)
+        val processedOrder = Collections.synchronizedList(ArrayList<String>())
+        session.onStart = {
+            listOf(
+                SessionAction.Listen(1, SessionChannel.VIDEO, "127.0.0.1", 0, 2),
+                SessionAction.Listen(3, SessionChannel.AUDIO, "127.0.0.1", 0, 4),
+            )
+        }
+        session.onListen = { id, p ->
+            if (id == 1) videoPort.set(p) else audioPort.set(p)
+            emptyList()
+        }
+        var videoCalls = 0
+        session.onBytes = { id, data ->
+            if (id == 2) {
+                videoCalls++
+                if (videoCalls == 1) {
+                    firstVideoEntered.countDown()
+                    assertTrue(allowFirstVideoFinish.await(5, TimeUnit.SECONDS))
+                }
+            }
+            processedOrder += "$id:${data.text()}"
+            allProcessed.countDown()
+            emptyList()
+        }
+        val runner = runner(session)
+        Socket("127.0.0.1", videoPort.get()).use { videoClient ->
+            Socket("127.0.0.1", audioPort.get()).use { audioClient ->
+                videoClient.tcpNoDelay = true
+                audioClient.tcpNoDelay = true
+                // 触发第一块 VIDEO 进入协议线程并暂停，模拟视频 I 帧耗时解码/拷贝期间队列积压。
+                videoClient.getOutputStream().write("v1".bytes())
+                assertTrue(firstVideoEntered.await(5, TimeUnit.SECONDS))
+                videoClient.getOutputStream().write("v2".bytes())
+                Thread.sleep(30)
+                audioClient.getOutputStream().write("a1".bytes())
+                Thread.sleep(30)
+                runner.submit {
+                    processedOrder += "task"
+                    allProcessed.countDown()
+                    emptyList()
+                }
+                audioClient.getOutputStream().write("a2".bytes())
+                Thread.sleep(30)
+                allowFirstVideoFinish.countDown()
+                assertTrue(allProcessed.await(5, TimeUnit.SECONDS))
+            }
+        }
+        runner.close()
+        assertTrue(runner.isTerminated)
+        assertNull(runner.failure)
+        val v2Index = processedOrder.indexOf("2:v2")
+        val a1Index = processedOrder.indexOf("4:a1")
+        val a2Index = processedOrder.indexOf("4:a2")
+        val taskIndex = processedOrder.indexOf("task")
+        assertTrue(a1Index in 1 until v2Index, "音频包应优先于排队中的视频数据：$processedOrder")
+        assertTrue(a2Index in 1 until v2Index, "后续音频包也应优先于视频：$processedOrder")
+        assertTrue(taskIndex in 1 until v2Index, "控制/触控任务应优先于视频：$processedOrder")
+        assertTrue(a1Index < a2Index, "同一音频通道内仍须严格保持先后顺序：$processedOrder")
+    }
+
     private companion object {
         val COUNTER = AtomicInteger()
     }

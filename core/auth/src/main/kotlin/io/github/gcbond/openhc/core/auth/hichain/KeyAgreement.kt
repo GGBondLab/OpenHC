@@ -143,9 +143,8 @@ internal class PakeServer(
             esk = random.draw(KeyAgreementConst.PAKE_ESK_LENGTH)
         }
         val secret = Hkdf.sha256(pin, salt, KeyAgreementConst.SPEKE_BASE_INFO, KeyAgreementConst.HKDF_SECRET_LENGTH)
-        val generator = Modp.modPow(secret, byteArrayOf(2), KeyAgreementConst.PRIME_LENGTH)
+        val epk = Modp.modPowTwiceExponent(secret, esk, KeyAgreementConst.PRIME_LENGTH)
         Arrays.fill(secret, 0)
-        val epk = Modp.modPow(generator, esk, KeyAgreementConst.PRIME_LENGTH)
         val text = HiChainBuild.pakeResponse(selfChallenge, salt, epk)
         base.setState(ProtocolState.START_RESPONSE)
         return text

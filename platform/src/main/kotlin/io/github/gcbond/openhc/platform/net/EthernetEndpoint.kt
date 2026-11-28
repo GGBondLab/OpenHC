@@ -116,17 +116,39 @@ class EthernetEndpoint(carAddress: ByteArray, carMac: ByteArray = DEFAULT_CAR_MA
         Ethernet.HEADER_LENGTH + Ipv4.totalLength(buffer, packetOffset)
 
     private fun handleArp(frame: ByteArray, offset: Int, length: Int, output: Output): Inbound {
-        val arp = try {
-            Arp.parse(frame, offset, length)
-        } catch (e: MalformedMessageException) {
+        if (length < Ethernet.HEADER_LENGTH + Arp.LENGTH) return Inbound.MALFORMED
+        val arp = offset + Ethernet.HEADER_LENGTH
+        if (frame.u16be(arp) != Arp.HARDWARE_ETHERNET || frame.u16be(arp + 2) != Ethernet.TYPE_IPV4 ||
+            frame.u8(arp + 4) != Ethernet.MAC_LENGTH || frame.u8(arp + 5) != Ipv4.ADDRESS_LENGTH
+        ) {
             return Inbound.MALFORMED
         }
-        if (arp.operation != Arp.OP_REQUEST || arp.isProbe || arp.isAnnouncement) return Inbound.ARP_IGNORED
-        if (!Ethernet.isUnicast(arp.senderMac)) return Inbound.MALFORMED
-        if (!arp.targetIp.contentEquals(carAddress)) return Inbound.ARP_FOR_OTHER_ADDRESS
-        learnPhone(arp.senderMac, 0, arp.senderIp, 0)
-        val n = Arp.writeReply(arp, carMac, arpReply, 0)
-        output.sendToPhone(arpReply, 0, n)
+        val senderMacOffset = arp + 8
+        val senderIpOffset = arp + 14
+        val targetIpOffset = arp + 24
+        if (frame.u16be(arp + 6) != Arp.OP_REQUEST ||
+            isAllZero(frame, senderIpOffset, Ipv4.ADDRESS_LENGTH) ||
+            regionEquals(frame, senderIpOffset, frame, targetIpOffset, Ipv4.ADDRESS_LENGTH)
+        ) {
+            return Inbound.ARP_IGNORED
+        }
+        if (!Ethernet.isUnicast(frame, senderMacOffset)) return Inbound.MALFORMED
+        if (!regionEquals(frame, targetIpOffset, carAddress, 0, Ipv4.ADDRESS_LENGTH)) return Inbound.ARP_FOR_OTHER_ADDRESS
+        learnPhone(frame, senderMacOffset, frame, senderIpOffset)
+        System.arraycopy(frame, senderMacOffset, arpReply, 0, Ethernet.MAC_LENGTH)
+        System.arraycopy(carMac, 0, arpReply, Ethernet.MAC_LENGTH, Ethernet.MAC_LENGTH)
+        arpReply.putU16be(12, Ethernet.TYPE_ARP)
+        val out = Ethernet.HEADER_LENGTH
+        arpReply.putU16be(out, Arp.HARDWARE_ETHERNET)
+        arpReply.putU16be(out + 2, Ethernet.TYPE_IPV4)
+        arpReply[out + 4] = Ethernet.MAC_LENGTH.toByte()
+        arpReply[out + 5] = Ipv4.ADDRESS_LENGTH.toByte()
+        arpReply.putU16be(out + 6, Arp.OP_REPLY)
+        System.arraycopy(carMac, 0, arpReply, out + 8, Ethernet.MAC_LENGTH)
+        System.arraycopy(carAddress, 0, arpReply, out + 14, Ipv4.ADDRESS_LENGTH)
+        System.arraycopy(frame, senderMacOffset, arpReply, out + 18, Ethernet.MAC_LENGTH)
+        System.arraycopy(frame, senderIpOffset, arpReply, out + 24, Ipv4.ADDRESS_LENGTH)
+        output.sendToPhone(arpReply, 0, arpReply.size)
         return Inbound.ARP_REPLIED
     }
 

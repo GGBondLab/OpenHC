@@ -89,17 +89,18 @@ internal class SessionFrameDecoder {
  * 载荷是 `IV(16) ‖ AES-128-CTR 密文`。长度不能为 0。
  */
 internal object ControlFrames {
+    const val HEADER_BYTES = 3
     const val FLAG_PLAIN = 0x00
     const val FLAG_ENCRYPTED = 0xAB
     const val MAX_PAYLOAD = 0xFFFF
 
     fun encode(flag: Int, payload: ByteArray): ByteArray {
         require(payload.isNotEmpty() && payload.size <= MAX_PAYLOAD) { "控制帧载荷长度非法: ${payload.size}" }
-        val out = ByteArray(3 + payload.size)
+        val out = ByteArray(HEADER_BYTES + payload.size)
         out[0] = flag.toByte()
         out[1] = (payload.size ushr 8).toByte()
         out[2] = payload.size.toByte()
-        System.arraycopy(payload, 0, out, 3, payload.size)
+        System.arraycopy(payload, 0, out, HEADER_BYTES, payload.size)
         return out
     }
 }

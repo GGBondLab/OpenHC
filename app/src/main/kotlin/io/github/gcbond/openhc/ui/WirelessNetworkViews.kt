@@ -59,11 +59,12 @@ internal fun RestoreWifiSetting() {
 internal fun wirelessNetworkText(state: WirelessUiState): String {
     val context = LocalContext.current
     val prefs = remember(context) { WirelessPreferences(context) }
+    val autoPrefs = remember(context) { CarHotspotAutoPreferences(context) }
     val direct = if (state.active) state.direct else prefs.usesWifiDirect
     return stringResource(
         when {
             direct -> R.string.wireless_network_line_direct
-            prefs.carHotspot -> if (CarHotspotAutoPreferences(context).enabled) {
+            prefs.carHotspot -> if (autoPrefs.enabled) {
                 R.string.wireless_network_line_car_auto
             } else {
                 R.string.wireless_network_line_car
@@ -80,7 +81,7 @@ internal fun wirelessNetworkText(state: WirelessUiState): String {
 @Composable
 internal fun WifiRestoreCard(modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val wireless = remember(context) { (context.applicationContext as? OpenHcApp)?.wireless } ?: return
+    val wireless = (context.applicationContext as? OpenHcApp)?.wirelessIfCreated ?: return
     val needed by wireless.wifiRestore.needsUser.collectAsState()
     if (!needed) return
     CardBox(modifier.fillMaxWidth(), color = Palette.WarnBackground, border = Palette.WarnBorder) {

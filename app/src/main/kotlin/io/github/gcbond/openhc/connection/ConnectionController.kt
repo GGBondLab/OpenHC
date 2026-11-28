@@ -53,7 +53,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.concurrent.thread
+import androidx.compose.runtime.Stable
 
 /**
  * 有线投屏的总调度：一次连接从开始到收尾、拔线重插的闸门、界面状态。进程内唯一（应用对象持有），
@@ -77,6 +77,7 @@ import kotlin.concurrent.thread
  * 线程：除 [sendInput]（主线程，直接投到协议线程）外，调度都在自己的 [HandlerThread] 上串行执行；
  * 公开方法可以在任意线程调用。
  */
+@Stable
 class ConnectionController(context: Context) {
 
     /** 前台服务监听：要不要留在前台、通知内容要不要更新。在主线程上回调。 */
@@ -380,7 +381,6 @@ class ConnectionController(context: Context) {
         )
         apply(ConnectionSignal.AttemptStarted(current.id))
         current.runner.start()
-        watchTermination(current)
     }
 
     /** 开始不了：回到空闲，显示原因。 */
@@ -421,7 +421,11 @@ class ConnectionController(context: Context) {
         val runner: SocketRunner = SocketRunner(
             session,
             { event -> onProtocolEvent(this, event) },
-            SocketRunner.Options(threadName = "OpenHC-Session-$id", log = { Log.i(TAG_SESSION, "[$id] $it") }),
+            SocketRunner.Options(
+                threadName = "OpenHC-Session-$id",
+                log = { Log.i(TAG_SESSION, "[$id] $it") },
+                onTerminated = { post { onRunnerTerminated(this) } },
+            ),
         )
 
         init {
@@ -436,6 +440,8 @@ class ConnectionController(context: Context) {
         var wired: WiredSession? = null
         var wiredEnded = false
         var replugRequired = false
+        var wiredDrainStop: Runnable? = null
+        var wiredStopTimeout: Runnable? = null
 
         /** 有线会话走到过「发 carInfo」或之后的状态：可能已经用掉了这次插入（有线会话没按时报结束时据此判断要不要拔线重插）。 */
         var carInfoMaybeSent = false
@@ -612,20 +618,6 @@ class ConnectionController(context: Context) {
         })
     }
 
-    /** 执行器意外退出（不会有 Ended 事件）时也要能收尾：另开一个线程等它结束。 */
-    private fun watchTermination(current: Attempt) {
-        thread(name = "OpenHC-SessionWatch-${current.id}", isDaemon = true) {
-            try {
-                while (!current.runner.awaitTermination(WATCH_SLICE_MS)) {
-                    // 一直等到执行器结束。
-                }
-            } catch (e: InterruptedException) {
-                return@thread
-            }
-            post { onRunnerTerminated(current) }
-        }
-    }
-
     private fun onRunnerTerminated(current: Attempt) {
         if (current.finished) return
         current.runner.failure?.let { failure ->
@@ -661,8 +653,8 @@ class ConnectionController(context: Context) {
         // 3. 有线链路：稍等一下，让 TEARDOWN 和关连接的包经 TUN、USB 发到手机，再停。
         val wired = current.wired
         if (wired != null && !current.wiredEnded) {
-            handler.postDelayed({ if (!current.wiredEnded) wired.stop() }, LINK_DRAIN_MS)
-            handler.postDelayed({
+            val drainStop = Runnable { if (!current.wiredEnded) wired.stop() }
+            val stopTimeout = Runnable {
                 if (!current.finished && !current.wiredEnded) {
                     Log.w(TAG, "有线会话 ${WIRED_STOP_TIMEOUT_MS / 1000} 秒内没有结束，不再等（下次开始可能报「已有有线会话」）")
                     current.wiredEnded = true
@@ -670,7 +662,11 @@ class ConnectionController(context: Context) {
                     current.replugRequired = current.carInfoMaybeSent
                     maybeFinish(current)
                 }
-            }, WIRED_STOP_TIMEOUT_MS)
+            }
+            current.wiredDrainStop = drainStop
+            current.wiredStopTimeout = stopTimeout
+            handler.postDelayed(drainStop, LINK_DRAIN_MS)
+            handler.postDelayed(stopTimeout, WIRED_STOP_TIMEOUT_MS)
         }
         maybeFinish(current)
     }
@@ -679,6 +675,10 @@ class ConnectionController(context: Context) {
         if (current.finished || !current.tearingDown || !current.runner.isTerminated) return
         if (current.wired != null && !current.wiredEnded) return
         current.finished = true
+        current.wiredDrainStop?.let(handler::removeCallbacks)
+        current.wiredStopTimeout?.let(handler::removeCallbacks)
+        current.wiredDrainStop = null
+        current.wiredStopTimeout = null
         if (attempt === current) {
             attempt = null
             inputTarget = null
@@ -837,7 +837,6 @@ class ConnectionController(context: Context) {
         /** 手机要连续拔下这么久，才自动开始下一次连接。 */
         private const val REPLUG_ABSENT_MS = 5_000L
         private const val GATE_POLL_MS = 500L
-        private const val WATCH_SLICE_MS = 60_000L
 
         private const val FOREGROUND_FAILED = "前台服务启动失败"
 

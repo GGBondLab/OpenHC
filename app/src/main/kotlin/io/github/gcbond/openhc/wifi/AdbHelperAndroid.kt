@@ -1,7 +1,7 @@
 package io.github.gcbond.openhc.wifi
 
 import android.content.Context
-import android.util.Log
+import io.github.gcbond.openhc.platform.log.Log
 import io.github.gcbond.openhc.core.common.adb.AdbAuth
 import io.github.gcbond.openhc.core.common.adb.AdbClient
 import java.io.BufferedInputStream
@@ -16,8 +16,7 @@ import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -143,10 +142,14 @@ internal class LocalAdbRunner(context: Context, private val helper: AdbHelper, p
     }
 }
 
-/** 单个后台线程（守护线程）。 */
+/** 单个后台线程（守护线程），空闲 60 秒后自动回收线程，不常驻占用栈内存。 */
 internal class ExecutorWorker(private val name: String) : AdbWorker {
-    private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
+    private val executor = ScheduledThreadPoolExecutor(1) { r ->
         Thread(r, name).apply { isDaemon = true }
+    }.apply {
+        setKeepAliveTime(60L, TimeUnit.SECONDS)
+        allowCoreThreadTimeOut(true)
+        removeOnCancelPolicy = true
     }
 
     override fun execute(task: () -> Unit) {

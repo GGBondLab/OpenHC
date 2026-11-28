@@ -36,7 +36,7 @@ object Base64 {
 
     /** 解码；忽略空白字符，长度或字符非法时抛 [IllegalArgumentException]。 */
     fun decode(text: String): ByteArray {
-        val s = text.filterNot { it.isWhitespace() }
+        val s = if (text.any { it.isWhitespace() }) text.filterNot { it.isWhitespace() } else text
         require(s.length % 4 == 0) { "Base64 长度必须是 4 的倍数: ${s.length}" }
         if (s.isEmpty()) return ByteArray(0)
         val pad = when {

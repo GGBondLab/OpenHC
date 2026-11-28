@@ -8,17 +8,23 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import io.github.gcbond.openhc.R
@@ -143,30 +149,65 @@ internal fun BootStartSettingsSection(autoConnect: Boolean = false, extraRows: @
             return@SettingsGroup
         }
 
-        // 悬浮窗权限
-        when {
-            !BootStartPolicy.overlayRequired(Build.VERSION.SDK_INT) -> GroupRow {
-                RowDescription(stringResource(R.string.settings_boot_overlay_not_needed, Build.VERSION.RELEASE))
-            }
-            overlay -> GroupRow { RowDescription(stringResource(R.string.settings_boot_overlay_granted)) }
-            else -> GroupRow(
-                Modifier.clickable(role = Role.Button) {
-                    openFirstAvailable(listOf(BootStart.overlaySettingsIntent(context), BootStart.appDetailsIntent(context)))
-                },
-            ) {
-                RowNote(stringResource(if (silent) R.string.settings_boot_overlay_missing_silent else R.string.settings_boot_overlay_missing))
+        // 悬浮窗权限：统一为「标题 + 状态胶囊 + 右侧去开启按钮」，触屏与电视遥控器均可清晰操作
+        val overlayRequired = BootStartPolicy.overlayRequired(Build.VERSION.SDK_INT)
+        GroupRow {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        RowTitle(stringResource(R.string.settings_boot_overlay_title))
+                        when {
+                            !overlayRequired -> StatusBadge(stringResource(R.string.settings_boot_overlay_badge_none), BadgeTone.NEUTRAL)
+                            overlay -> StatusBadge(stringResource(R.string.settings_boot_overlay_badge_ok), BadgeTone.POSITIVE)
+                            else -> StatusBadge(stringResource(R.string.settings_boot_overlay_badge_missing), BadgeTone.WARN)
+                        }
+                    }
+                    when {
+                        !overlayRequired -> RowDescription(
+                            stringResource(R.string.settings_boot_overlay_not_needed, Build.VERSION.RELEASE),
+                            Modifier.padding(top = 4.dp),
+                        )
+                        overlay -> RowDescription(
+                            stringResource(R.string.settings_boot_overlay_granted),
+                            Modifier.padding(top = 4.dp),
+                        )
+                        else -> RowNote(
+                            stringResource(if (silent) R.string.settings_boot_overlay_missing_silent else R.string.settings_boot_overlay_missing),
+                        )
+                    }
+                }
+                if (overlayRequired && !overlay) {
+                    Spacer(Modifier.width(12.dp))
+                    ActionButton(
+                        stringResource(R.string.settings_boot_overlay_action),
+                        kind = ActionKind.PRIMARY,
+                        onClick = {
+                            openFirstAvailable(listOf(BootStart.overlaySettingsIntent(context), BootStart.appDetailsIntent(context)))
+                        },
+                    )
+                }
             }
         }
         // 车机系统的自启动管理：比亚迪直接打开它的对话框；别的车机只能说明，给个本应用系统设置页的入口
         if (bydAutostart != null) {
             BydAutostartRow { openFirstAvailable(listOf(bydAutostart, BootStart.appDetailsIntent(context))) }
         } else {
-            GroupRow(spacing = 8.dp) {
-                RowHeader(stringResource(R.string.settings_boot_autostart_title), stringResource(R.string.settings_boot_autostart_note))
-                ActionButton(
-                    stringResource(R.string.settings_boot_open_app_settings),
-                    onClick = { openFirstAvailable(listOf(BootStart.appDetailsIntent(context))) },
-                )
+            GroupRow {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    RowHeader(
+                        stringResource(R.string.settings_boot_autostart_title),
+                        stringResource(R.string.settings_boot_autostart_note),
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    ActionButton(
+                        stringResource(R.string.settings_boot_open_app_settings),
+                        onClick = { openFirstAvailable(listOf(BootStart.appDetailsIntent(context))) },
+                    )
+                }
             }
         }
         // 上次开机的结果
@@ -207,9 +248,16 @@ private fun lastBootText(record: BootRecord): String {
 /** 比亚迪车机的后台启动放行：说明 + 直接打开它的「选择禁止后台启动项」对话框。 */
 @Composable
 private fun BydAutostartRow(onOpen: () -> Unit) {
-    GroupRow(spacing = 8.dp) {
-        RowHeader(stringResource(R.string.settings_boot_byd_title), stringResource(R.string.settings_boot_byd_note))
-        ActionButton(stringResource(R.string.settings_boot_open_byd), onClick = onOpen)
+    GroupRow {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            RowHeader(
+                stringResource(R.string.settings_boot_byd_title),
+                stringResource(R.string.settings_boot_byd_note),
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(12.dp))
+            ActionButton(stringResource(R.string.settings_boot_open_byd), onClick = onOpen)
+        }
     }
 }
 

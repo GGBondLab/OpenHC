@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 连接期间留在前台，切到后台不断（安卓 9 起要声明）。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 投屏期间保持 CPU 与无线网卡低延迟唤醒，防止车机切后台或关屏听歌时 Wi-Fi 进省电休眠抖动断流。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 安卓 14 起前台服务要按类型声明权限。 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <!--
@@ -56,6 +58,26 @@
         android:usesPermissionFlags="neverForLocation"
         tools:ignore="UnusedAttribute" />
 
+    <!-- 兼容无触屏电视 / 投影仪与安卓车机桌面。 -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.microphone"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
+        android:required="false" />
+
     <!-- 没有蓝牙的车机仍可安装，只是用不了无线连接。 -->
     <uses-feature
         android:name="android.hardware.bluetooth"
@@ -84,6 +106,7 @@
     <application
         android:name=".OpenHcApp"
         android:allowBackup="false"
+        android:banner="@drawable/tv_banner"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
         android:icon="@drawable/ic_launcher"
@@ -103,6 +126,7 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
 
@@ -124,13 +148,15 @@
                 android:resource="@xml/usb_device_filter" />
         </activity-alias>
 
-        <!-- 开机自动打开（设置里的开关启停它，默认停用）：开机广播只有系统能发。 -->
+        <!-- 开机自动打开（设置里的开关启停它，默认停用）：开机广播只有系统能发（含部分车机快启广播）。 -->
         <receiver
             android:name=".startup.BootStartReceiver"
             android:enabled="false"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 

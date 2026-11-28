@@ -111,8 +111,6 @@ internal class LePairingSession(context: Context) {
         closed = true
         Log.i(TAG, "补配对结束（$why），状态 ${status.value.stage}")
         shutdown()
-        visibility?.removeListener(visibilityListener)
-        main.removeCallbacks(expire)
         if (LePairingNames.active === this) LePairingNames.active = null
     }
 
@@ -255,6 +253,8 @@ internal class LePairingSession(context: Context) {
 
     /** 关掉入口、注销广播接收、改回名称。可重复调用。 */
     private fun shutdown() {
+        visibility?.removeListener(visibilityListener)
+        main.removeCallbacks(expire)
         nameWait?.let { main.removeCallbacks(it) }
         nameWait = null
         peripheral?.close()

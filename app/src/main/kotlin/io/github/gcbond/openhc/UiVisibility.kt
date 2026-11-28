@@ -17,6 +17,7 @@ internal class UiVisibility : Application.ActivityLifecycleCallbacks {
         fun onUiVisibilityChanged(visible: Boolean)
     }
 
+    @Volatile
     private var started = 0
     private val listeners = CopyOnWriteArrayList<Listener>()
 

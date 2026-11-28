@@ -80,13 +80,17 @@ class WirelessRunnerBridge(
         route(session.onWifiNetworkReady(id, network, nowMillis))
 
     /** 发触摸或按键，见 [WirelessReceiverSession.sendInput]；在协议线程上调用，例如 `runner.submit { bridge.sendInput(input) }`。 */
-    fun sendInput(input: HiSightInput): List<SessionOutput> = route(session.sendInput(input))
+    fun sendInput(input: HiSightInput): List<SessionOutput> {
+        if (backlog.isEmpty() && !drainScheduled) return session.sendInputDirect(input)
+        return route(session.sendInput(input))
+    }
 
     /** 把车机的音频焦点变化告诉手机，见 [WirelessReceiverSession.sendAudioFocus]；在协议线程上调用。 */
     fun sendAudioFocus(change: CarAudioFocus): List<SessionOutput> = route(session.sendAudioFocus(change))
 
     private fun route(outputs: List<WirelessOutput>): List<SessionOutput> {
-        backlog.addAll(outputs)
+        if (outputs.isEmpty() && backlog.isEmpty()) return emptyList()
+        if (outputs.isNotEmpty()) backlog.addAll(outputs)
         return if (drainScheduled) emptyList() else drain()
     }
 

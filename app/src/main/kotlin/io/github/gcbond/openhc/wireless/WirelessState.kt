@@ -1,5 +1,6 @@
 package io.github.gcbond.openhc.wireless
 
+import androidx.compose.runtime.Immutable
 import io.github.gcbond.openhc.connection.ConnectionReducer
 import io.github.gcbond.openhc.connection.ConnectionSignal
 import io.github.gcbond.openhc.connection.ConnectionUiState
@@ -164,6 +165,7 @@ sealed class WirelessSignal {
 }
 
 /** 无线连接页看的状态。 */
+@Immutable
 data class WirelessUiState(
     val phase: WirelessPhase = WirelessPhase.IDLE,
     val step: WirelessStep? = null,

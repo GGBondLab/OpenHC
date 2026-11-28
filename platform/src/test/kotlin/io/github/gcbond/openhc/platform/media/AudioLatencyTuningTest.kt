@@ -162,6 +162,43 @@ class AudioLatencyTuningTest {
         assertEquals(500, queue.startTrimmedFrames, "重新起播时 800 帧压回 300")
     }
 
+    /** 停车开门等网络抖动后 TCP 连续补包时，起播窗口不能每 5ms 连续删块造成倍速快进播放。 */
+    @Test
+    fun startWindowDoesNotMicroChopBurstyPcmIntoFastForward() {
+        val clock = FakeClock()
+        val queue = AudioJitterQueue(
+            startFrames = 18_240,
+            targetFrames = 19_200,
+            maxFrames = 28_800,
+            trimHoldMillis = 2_000,
+            trimSpacingMillis = 200,
+            trimStepFrames = 960,
+            startWindowMillis = 1_000,
+            clockNanos = clock::nanos,
+        )
+        var seq = 0
+        fun offerTagged() {
+            queue.offer(byteArrayOf((seq++).toByte()), 256)
+        }
+        // 起播瞬间积压 450ms（84 包）：首包只一次性压回目标一次。
+        repeat(84) { offerTagged() }
+        val first = assertNotNull(queue.take(0))
+        val trimmedAfterFirst = queue.startTrimmedFrames
+        assertTrue(trimmedAfterFirst > 0, "首包应一次性压回目标")
+        var expectedNext = (first.data[0].toInt() and 0xFF) + 1
+
+        // 接下来的 300ms 内模拟 TCP 补包（每 5ms 来 2 包、播 1 包）：冷却期内严禁微切跳包，必须连续原速播放。
+        repeat(30) {
+            clock.millis += 5
+            offerTagged()
+            offerTagged()
+            val chunk = assertNotNull(queue.take(0))
+            assertEquals(expectedNext and 0xFF, chunk.data[0].toInt() and 0xFF, "冷却期内不应连续跳包造成倍速播放")
+            expectedNext++
+        }
+        assertEquals(trimmedAfterFirst, queue.startTrimmedFrames, "400ms 冷却期内不应再次触发起播压回")
+    }
+
     @Test
     fun levelAtOrBelowTargetIsNeverTrimmed() {
         val clock = FakeClock()

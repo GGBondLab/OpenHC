@@ -150,28 +150,45 @@ class WiredSession(
      */
     private fun scanDevices() {
         val usb = usbManager ?: return
-        val devices = try {
-            usb.deviceList.values.toList()
+        val deviceMap = try {
+            usb.deviceList
         } catch (e: RuntimeException) {
             return
         }
         when (phase) {
             Phase.WAIT_PHONE -> {
-                val normal = devices.firstOrNull { UsbDescriber.phoneMode(it) == PhoneUsbMode.NORMAL }
+                var normal: UsbDevice? = null
+                var debugging = false
+                for (device in deviceMap.values) {
+                    when (UsbDescriber.phoneMode(device)) {
+                        PhoneUsbMode.NORMAL -> {
+                            normal = device
+                            break
+                        }
+                        PhoneUsbMode.USB_DEBUGGING -> debugging = true
+                        else -> Unit
+                    }
+                }
                 when {
                     normal != null -> beginPhonePermission(normal)
-                    devices.any { UsbDescriber.phoneMode(it) == PhoneUsbMode.USB_DEBUGGING } ->
-                        setState(WiredState.UsbDebuggingOn)
+                    debugging -> setState(WiredState.UsbDebuggingOn)
                     else -> setState(WiredState.WaitingForPhone)
                 }
             }
             Phase.PERMISSION_PHONE ->
-                if (devices.none { it.deviceName == target }) backToWaitPhone("授权前手机被拔掉")
-            Phase.WAIT_NCM -> devices.firstOrNull {
-                it.deviceName !in staleNcm && UsbDescriber.phoneMode(it) == PhoneUsbMode.NCM
-            }?.let { onNcmDevice(it) }
+                if (target == null || !deviceMap.containsKey(target)) backToWaitPhone("授权前手机被拔掉")
+            Phase.WAIT_NCM -> {
+                var found: UsbDevice? = null
+                for (device in deviceMap.values) {
+                    if (device.deviceName !in staleNcm && UsbDescriber.phoneMode(device) == PhoneUsbMode.NCM) {
+                        found = device
+                        break
+                    }
+                }
+                if (found != null) onNcmDevice(found)
+            }
             Phase.PERMISSION_NCM, Phase.CONNECTED ->
-                if (devices.none { it.deviceName == target }) end(WiredEndReason.PHONE_UNPLUGGED)
+                if (target == null || !deviceMap.containsKey(target)) end(WiredEndReason.PHONE_UNPLUGGED)
             Phase.IDLE, Phase.ENDED -> Unit
         }
     }

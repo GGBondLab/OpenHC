@@ -112,8 +112,12 @@ internal class SpeakerSession(
         var broken = false
         private var firstPacket = true
 
-        /** 每一路（SSRC）上次放到的通道，用来在第一次出现、换通道时出一条事件。 */
+        /** 每一路（SSRC）上次放到的通道，用来在第一次出现、换通道时出一条事件。2 槽缓存覆盖音乐+导航双路交错。 */
         private val routed = HashMap<Long, AudioRoute>()
+        private var fastLane0 = Long.MIN_VALUE
+        private var fastRoute0: AudioRoute? = null
+        private var fastLane1 = Long.MIN_VALUE
+        private var fastRoute1: AudioRoute? = null
 
         fun finish() {
             if (finished) return
@@ -130,7 +134,7 @@ internal class SpeakerSession(
         private inline fun parse(block: () -> Unit) {
             try {
                 block()
-            } catch (e: RuntimeException) {
+            } catch (e: Exception) {
                 broken = true
                 note(stream.info, "拆包出错（${e.javaClass.simpleName}：${e.message}），之后只交原始字节")
             }
@@ -150,9 +154,24 @@ internal class SpeakerSession(
             val route = router.route(packet.bus, packet.usage)
             packet.route = route
             // 按路记：同一个 SSRC 上可能有几路（包尾路号不同），各报一次，之后只在换通道时再报。
-            if (routed[packet.lane] != route && (routed.size < MAX_ROUTED_STREAMS || packet.lane in routed)) {
-                routed[packet.lane] = route
-                emit(AudioEvent.StreamRouted(stream.info, packet.ssrc, packet.bus, packet.usage, route))
+            val lane = packet.lane
+            if (!((lane == fastLane0 && fastRoute0 == route) || (lane == fastLane1 && fastRoute1 == route))) {
+                val tracked: AudioRoute?
+                if (routed[lane] != route && (routed.size < MAX_ROUTED_STREAMS || lane in routed)) {
+                    routed[lane] = route
+                    tracked = route
+                    emit(AudioEvent.StreamRouted(stream.info, packet.ssrc, packet.bus, packet.usage, route))
+                } else {
+                    tracked = routed[lane]
+                }
+                if (lane == fastLane0) {
+                    fastRoute0 = tracked
+                } else {
+                    fastLane1 = fastLane0
+                    fastRoute1 = fastRoute0
+                    fastLane0 = lane
+                    fastRoute0 = tracked
+                }
             }
             if (firstPacket) {
                 firstPacket = false

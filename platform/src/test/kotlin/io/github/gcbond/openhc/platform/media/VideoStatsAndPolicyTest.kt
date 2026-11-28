@@ -201,7 +201,12 @@ class VideoStatsAndPolicyTest {
         assertEquals(2, VendorLowLatency.keys("OMX.hisi.video.decoder.avc", true).size)
         assertEquals(listOf("vendor.rtc-ext-dec-low-latency.enable" to 1), VendorLowLatency.keys("c2.exynos.h264.decoder", true))
         assertEquals(listOf("vendor.low-latency.enable" to 1), VendorLowLatency.keys("OMX.amlogic.avc.decoder.awesome", true))
-        assertEquals(emptyList(), VendorLowLatency.keys("OMX.MTK.VIDEO.DECODER.AVC", true))
+        assertEquals(
+            listOf("vendor.mtk.ext.dec.low-latency.enable" to 1, "vdec-lowlatency" to 1),
+            VendorLowLatency.keys("OMX.MTK.VIDEO.DECODER.AVC", true),
+        )
+        assertEquals(listOf("vendor.sprd-low-latency.enable" to 1), VendorLowLatency.keys("c2.unisoc.avc.decoder", true))
+        assertEquals(listOf("vendor.rk-low-latency.enable" to 1), VendorLowLatency.keys("OMX.rk.video_decoder.avc", true))
         assertEquals(emptyList(), VendorLowLatency.keys("c2.android.avc.decoder", true))
     }
 }

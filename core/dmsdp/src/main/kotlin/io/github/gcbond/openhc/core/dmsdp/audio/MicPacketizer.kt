@@ -34,7 +34,6 @@ import java.security.SecureRandom
 internal class MicPacketizer(private val cipher: AesCtr, private val random: SecureRandom) {
     private var sequence = 0
     private val iv = ByteArray(AesCtr.IV_BYTES)
-    private val plain = ByteArray(RTP_HEADER + PCM_HEADER + PCM_FRAGMENT)
 
     /** 送出的包数。 */
     var packets = 0L
@@ -62,14 +61,17 @@ internal class MicPacketizer(private val cipher: AesCtr, private val random: Sec
                 last -> POSITION_LAST
                 else -> POSITION_MIDDLE
             }
-            writeRtpHeader(PT_PCM, marker = last, timestamp = timestamp)
-            val h = RTP_HEADER
-            plain.fill(0, h, h + PCM_HEADER)
-            plain[h + 1] = position.toByte()
-            putU16(plain, h + 4, index)
-            putU16(plain, h + 10, n)
-            System.arraycopy(data, offset + start, plain, h + PCM_HEADER, n)
-            frames += seal(RTP_HEADER + PCM_HEADER + n)
+            val rtpLen = RTP_HEADER + PCM_HEADER + n
+            val frame = allocateFrame(rtpLen)
+            val rtpAt = FRAME_HEADER + AesCtr.IV_BYTES
+            writeRtpHeader(frame, rtpAt, PT_PCM, marker = last, timestamp = timestamp)
+            val h = rtpAt + RTP_HEADER
+            frame[h + 1] = position.toByte()
+            putU16(frame, h + 4, index)
+            putU16(frame, h + 10, n)
+            System.arraycopy(data, offset + start, frame, h + PCM_HEADER, n)
+            sealFrameInPlace(frame, rtpLen)
+            frames += frame
         }
         return frames
     }
@@ -80,35 +82,40 @@ internal class MicPacketizer(private val cipher: AesCtr, private val random: Sec
     fun aac(data: ByteArray, offset: Int, length: Int, timestamp: Long): ByteArray {
         require(offset >= 0 && length >= 0 && offset <= data.size - length) { "范围非法" }
         require(length in 1..MAX_AAC_FRAME) { "一个 AAC 帧应为 1～$MAX_AAC_FRAME 字节: $length" }
-        val buffer = ByteArray(RTP_HEADER + length)
-        writeRtpHeader(PT_AAC, marker = true, timestamp = timestamp, target = buffer)
-        System.arraycopy(data, offset, buffer, RTP_HEADER, length)
-        return seal(buffer, buffer.size)
+        val rtpLen = RTP_HEADER + length
+        val frame = allocateFrame(rtpLen)
+        val rtpAt = FRAME_HEADER + AesCtr.IV_BYTES
+        writeRtpHeader(frame, rtpAt, PT_AAC, marker = true, timestamp = timestamp)
+        System.arraycopy(data, offset, frame, rtpAt + RTP_HEADER, length)
+        sealFrameInPlace(frame, rtpLen)
+        return frame
     }
 
-    private fun writeRtpHeader(payloadType: Int, marker: Boolean, timestamp: Long, target: ByteArray = plain) {
-        target[0] = RTP_VERSION_BYTE.toByte()
-        target[1] = (payloadType or (if (marker) MARKER else 0)).toByte()
-        putU16(target, 2, sequence)
-        putU32(target, 4, timestamp)
-        putU32(target, 8, SSRC.toLong())
-        sequence = (sequence + 1) and 0xFFFF
-    }
-
-    private fun seal(length: Int): ByteArray = seal(plain, length)
-
-    /** `0xAB ‖ 长度 ‖ IV ‖ 密文`：直接加密进最终的帧，不另外复制。 */
-    private fun seal(source: ByteArray, length: Int): ByteArray {
-        random.nextBytes(iv)
-        val sealedLength = AesCtr.IV_BYTES + length
+    private fun allocateFrame(rtpLen: Int): ByteArray {
+        val sealedLength = AesCtr.IV_BYTES + rtpLen
         val frame = ByteArray(FRAME_HEADER + sealedLength)
         frame[0] = FRAME_ENCRYPTED.toByte()
         putU16(frame, 1, sealedLength)
+        return frame
+    }
+
+    private fun writeRtpHeader(target: ByteArray, at: Int, payloadType: Int, marker: Boolean, timestamp: Long) {
+        target[at] = RTP_VERSION_BYTE.toByte()
+        target[at + 1] = (payloadType or (if (marker) MARKER else 0)).toByte()
+        putU16(target, at + 2, sequence)
+        putU32(target, at + 4, timestamp)
+        putU32(target, at + 8, SSRC.toLong())
+        sequence = (sequence + 1) and 0xFFFF
+    }
+
+    /** `0xAB ‖ 长度 ‖ IV ‖ 密文`：直接在最终帧缓冲内原地加密，零中间缓冲分配。 */
+    private fun sealFrameInPlace(frame: ByteArray, rtpLen: Int) {
+        random.nextBytes(iv)
         System.arraycopy(iv, 0, frame, FRAME_HEADER, AesCtr.IV_BYTES)
-        cipher.transform(iv, source, 0, length, frame, FRAME_HEADER + AesCtr.IV_BYTES)
+        val rtpAt = FRAME_HEADER + AesCtr.IV_BYTES
+        cipher.transformWithIvAt(frame, FRAME_HEADER, frame, rtpAt, rtpLen, frame, rtpAt)
         packets++
         bytes += frame.size
-        return frame
     }
 
     internal companion object {

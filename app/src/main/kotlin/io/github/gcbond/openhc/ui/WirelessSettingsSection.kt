@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -16,8 +17,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusDirection
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -164,6 +174,26 @@ internal fun WirelessModeSetting(state: WirelessSettingsState) {
 /** 车机自带热点的名称、密码（输入即保存，密码显示成圆点；宽屏时并排）和频段。 */
 @Composable
 private fun CarHotspotFields(state: WirelessSettingsState) {
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val dpadEscape: Modifier.() -> Modifier = {
+        onPreviewKeyEvent { event ->
+            if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+            when (event.key) {
+                Key.DirectionDown -> {
+                    keyboardController?.hide()
+                    focusManager.moveFocus(FocusDirection.Down)
+                    true
+                }
+                Key.DirectionUp -> {
+                    keyboardController?.hide()
+                    focusManager.moveFocus(FocusDirection.Up)
+                    true
+                }
+                else -> false
+            }
+        }
+    }
     GroupRow(spacing = 8.dp) {
         val name: @Composable (Modifier) -> Unit = { modifier ->
             OutlinedTextField(
@@ -171,7 +201,9 @@ private fun CarHotspotFields(state: WirelessSettingsState) {
                 onValueChange = { state.changeCarHotspotName(it) },
                 label = { Text(stringResource(R.string.settings_car_hotspot_name)) },
                 singleLine = true,
-                modifier = modifier,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                keyboardActions = KeyboardActions(onNext = { focusManager.moveFocus(FocusDirection.Next) }),
+                modifier = modifier.dpadEscape(),
             )
         }
         val password: @Composable (Modifier) -> Unit = { modifier ->
@@ -181,8 +213,12 @@ private fun CarHotspotFields(state: WirelessSettingsState) {
                 label = { Text(stringResource(R.string.settings_car_hotspot_password)) },
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                modifier = modifier,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = {
+                    keyboardController?.hide()
+                    focusManager.moveFocus(FocusDirection.Down)
+                }),
+                modifier = modifier.dpadEscape(),
             )
         }
         BoxWithConstraints(Modifier.fillMaxWidth()) {

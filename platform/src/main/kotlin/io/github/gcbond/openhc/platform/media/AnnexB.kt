@@ -62,14 +62,14 @@ object AnnexB {
      */
     internal fun findStartCode(data: ByteArray, from: Int, end: Int): Int {
         var i = from
-        while (i + 2 < end) {
-            val third = data[i + 2].toInt()
-            when (third) {
+        val limit = end - 2
+        while (i < limit) {
+            when (data[i + 2].toInt()) {
                 1 -> {
                     if (data[i].toInt() == 0 && data[i + 1].toInt() == 0) return i
                     i += 3
                 }
-                0 -> i++
+                0 -> i += if (data[i + 1].toInt() == 0) 1 else 2
                 else -> i += 3
             }
         }

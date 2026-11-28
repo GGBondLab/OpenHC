@@ -1,12 +1,14 @@
 package io.github.gcbond.openhc.settings
 
 import android.content.Context
+import androidx.compose.runtime.Stable
 import androidx.core.content.edit
 import io.github.gcbond.openhc.connection.DisplayPlan
 
 /**
  * 应用设置（SharedPreferences）。连接相关的几项在下一次连接开始时读。任意线程可读写。
  */
+@Stable
 class AppSettings(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -44,24 +46,54 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_FULL_SCREEN, true)
         set(value) = prefs.edit { putBoolean(KEY_FULL_SCREEN, value) }
 
-    /** 界面用深色（默认）还是浅色：页面顶上的太阳 / 月亮切换。 */
+    /** 界面主题模式：自动跟随车机（默认）、浅色、深色。 */
+    var themeMode: Int
+        get() {
+            if (prefs.contains(KEY_THEME_MODE)) {
+                val mode = prefs.getInt(KEY_THEME_MODE, THEME_AUTO)
+                if (mode in THEME_AUTO..THEME_DARK) return mode
+            }
+            if (prefs.contains(KEY_DARK_THEME)) {
+                return if (prefs.getBoolean(KEY_DARK_THEME, true)) THEME_DARK else THEME_LIGHT
+            }
+            return THEME_AUTO
+        }
+        set(value) = prefs.edit { putInt(KEY_THEME_MODE, value.coerceIn(THEME_AUTO, THEME_DARK)) }
+
+    /** 按当前主题模式和车机系统的昼夜状态（大灯/夜间模式）算出此刻该用深色还是浅色。 */
+    fun resolveDark(context: Context): Boolean = when (themeMode) {
+        THEME_LIGHT -> false
+        THEME_DARK -> true
+        else -> (context.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
+            android.content.res.Configuration.UI_MODE_NIGHT_YES
+    }
+
+    /** 兼容旧字段：直接读写深浅色时同步更新 [themeMode]。 */
     var darkTheme: Boolean
-        get() = prefs.getBoolean(KEY_DARK_THEME, true)
-        set(value) = prefs.edit { putBoolean(KEY_DARK_THEME, value) }
+        get() = themeMode != THEME_LIGHT
+        set(value) {
+            themeMode = if (value) THEME_DARK else THEME_LIGHT
+            prefs.edit { putBoolean(KEY_DARK_THEME, value) }
+        }
 
     /** 安卓 13 起的通知权限问过一次了（拒绝了也不再追问）。 */
     var notificationPermissionAsked: Boolean
         get() = prefs.getBoolean(KEY_NOTIFICATION_ASKED, false)
         set(value) = prefs.edit { putBoolean(KEY_NOTIFICATION_ASKED, value) }
 
-    private companion object {
-        const val FILE = "openhc-settings"
-        const val KEY_FPS = "fps"
-        const val KEY_UI_SCALE = "ui_scale_percent"
-        const val KEY_MANUAL_BT = "manual_bluetooth_address"
-        const val KEY_USB_ATTACH_ACCEPTED = "usb_attach_accepted"
-        const val KEY_NOTIFICATION_ASKED = "notification_permission_asked"
-        const val KEY_FULL_SCREEN = "full_screen"
-        const val KEY_DARK_THEME = "dark_theme"
+    companion object {
+        const val THEME_AUTO = 0
+        const val THEME_LIGHT = 1
+        const val THEME_DARK = 2
+
+        private const val FILE = "openhc-settings"
+        private const val KEY_FPS = "fps"
+        private const val KEY_UI_SCALE = "ui_scale_percent"
+        private const val KEY_MANUAL_BT = "manual_bluetooth_address"
+        private const val KEY_USB_ATTACH_ACCEPTED = "usb_attach_accepted"
+        private const val KEY_NOTIFICATION_ASKED = "notification_permission_asked"
+        private const val KEY_FULL_SCREEN = "full_screen"
+        private const val KEY_DARK_THEME = "dark_theme"
+        private const val KEY_THEME_MODE = "theme_mode"
     }
 }

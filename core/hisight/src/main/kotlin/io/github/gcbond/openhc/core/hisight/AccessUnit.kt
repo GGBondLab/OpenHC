@@ -47,7 +47,8 @@ class AccessUnit internal constructor() {
      * 每次调用都会扫描整帧，不需要时不要调用。
      */
     fun nalTypes(): IntArray {
-        val types = ArrayList<Int>()
+        var types = IntArray(8)
+        var count = 0
         val end = offset + length
         var i = offset
         while (i + 2 < end) {
@@ -58,14 +59,17 @@ class AccessUnit internal constructor() {
                     else -> -1
                 }
                 if (startCodeEnd > 0) {
-                    if (startCodeEnd < end) types += data[startCodeEnd].toInt() and 0x1F
+                    if (startCodeEnd < end) {
+                        if (count == types.size) types = types.copyOf(types.size * 2)
+                        types[count++] = data[startCodeEnd].toInt() and 0x1F
+                    }
                     i = startCodeEnd
                     continue
                 }
             }
             i++
         }
-        return types.toIntArray()
+        return if (count == types.size) types else types.copyOf(count)
     }
 }
 

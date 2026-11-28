@@ -15,6 +15,7 @@ import java.text.SimpleDateFormat
 import java.util.ArrayList
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -54,9 +55,13 @@ internal object LogRecorder {
     private val queueNotEmpty = queueLock.newCondition()
 
     @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
     private var dir: File? = null
 
     // 以下由 fileLock 保护。
+    private var writerInitialized = false
     private var writer: BufferedWriter? = null
     private var written = 0L
 
@@ -66,12 +71,37 @@ internal object LogRecorder {
 
     private val pid = Process.myPid()
 
-    /** 开始记（应用启动时调一次；再调不做什么）。 */
-    fun start(context: Context) {
+    private fun interface LiveListener {
+        fun onLine(line: String)
+    }
+
+    private val liveListeners = CopyOnWriteArrayList<LiveListener>()
+
+    /**
+     * 挂载设置页「实时日志」缓冲：先把排队日志落盘并回填最近 [LiveLogBuffer.maxLines] 行，再把后续每一行实时送入 [buffer]。
+     * 返回解绑函数，离开诊断页时调，日常投屏和首页期间零额外开销。
+     */
+    fun attachLive(buffer: LiveLogBuffer, onWake: () -> Unit): () -> Unit {
+        val listener = LiveListener { line ->
+            if (buffer.enqueueRaw(line)) onWake()
+        }
         synchronized(fileLock) {
-            if (dir != null) return
-            dir = File(context.filesDir, DIR).apply { mkdirs() }
-            openWriter()
+            ensureWriterLocked()
+            writeQueued()
+            flushQuietly()
+            buffer.enqueueInitial(LiveLogBuffer.readTailRaw(logFiles(), buffer.maxLines))
+            liveListeners.add(listener)
+        }
+        onWake()
+        return { liveListeners.remove(listener) }
+    }
+
+    /** 开始记（应用启动时调一次；再调不做什么）。主线程只挂内存回调并起后台线程，建目录与开文件留到后台写线程执行。 */
+    fun start(context: Context) {
+        val app = context.applicationContext ?: context
+        synchronized(fileLock) {
+            if (appContext != null) return
+            appContext = app
         }
         // 先接上自己的日志，之后打的每一行都不再依赖 logcat。
         Log.sink = Log.Sink { priority, tag, message, error -> enqueue(priority, tag, message, error) }
@@ -82,16 +112,17 @@ internal object LogRecorder {
 
     /** 现有的日志文件，旧的在前。 */
     fun logFiles(): List<File> {
-        val d = dir ?: return emptyList()
+        val d = ensureDir() ?: return emptyList()
         return listOf(File(d, PREVIOUS), File(d, CURRENT)).filter { it.isFile }
     }
 
     /** 上次启动时读到的崩溃记录文件（没有就 null）。 */
-    fun crashFile(): File? = dir?.let { File(it, CRASH) }?.takeIf { it.isFile && it.length() > 0 }
+    fun crashFile(): File? = ensureDir()?.let { File(it, CRASH) }?.takeIf { it.isFile && it.length() > 0 }
 
     /** 把队列里和缓冲里还没写进文件的行写进去（导出前调）。 */
     fun flush() {
         synchronized(fileLock) {
+            ensureWriterLocked()
             writeQueued()
             flushQuietly()
         }
@@ -185,9 +216,14 @@ internal object LogRecorder {
                     val line = reader.readLine() ?: break
                     if (filterLines && !DiagnosticsReport.fromProcess(line, ownPid)) continue
                     if (DiagnosticsReport.writtenDirectly(line)) continue
+                    val more = try {
+                        reader.ready()
+                    } catch (_: IOException) {
+                        false
+                    }
                     synchronized(fileLock) {
                         writeLine(line)
-                        flushQuietly()
+                        if (!more) flushQuietly()
                     }
                 }
             }
@@ -204,7 +240,11 @@ internal object LogRecorder {
 
     private fun markLine(text: String): String = "===== ${now()} OpenHC 诊断记录：$text ====="
 
-    private fun now(): String = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+    private val timeFormat = object : ThreadLocal<SimpleDateFormat>() {
+        override fun initialValue(): SimpleDateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
+    }
+
+    private fun now(): String = timeFormat.get()!!.format(Date())
 
     /** 调用时持有 [fileLock]。 */
     private fun flushQuietly() {
@@ -215,22 +255,62 @@ internal object LogRecorder {
         }
     }
 
-    /** 调用时持有 [fileLock]。不 flush：由调用方按批 flush（写文件线程每批一次，读 logcat 每行一次，导出前一次）。 */
+    /** 调用时持有 [fileLock]。不 flush：由调用方按批 flush（写文件线程每批一次，读 logcat 批量一次，导出前一次）。 */
     private fun writeLine(line: String) {
+        ensureWriterLocked()
+        if (liveListeners.isNotEmpty()) {
+            for (listener in liveListeners) listener.onLine(line)
+        }
         val w = writer ?: return
         try {
             w.write(line)
             w.write("\n")
-            written += line.toByteArray(Charsets.UTF_8).size + 1L
+            written += utf8ByteLength(line) + 1L
             if (written >= MAX_FILE_BYTES) rotate()
         } catch (e: IOException) {
             // 写满或者文件出问题：丢这一行，下一行再试。
         }
     }
 
+    private fun utf8ByteLength(s: String): Int {
+        var bytes = 0
+        var i = 0
+        val len = s.length
+        while (i < len) {
+            val c = s[i].code
+            when {
+                c < 0x80 -> bytes += 1
+                c < 0x800 -> bytes += 2
+                c in 0xD800..0xDBFF && i + 1 < len && s[i + 1].code in 0xDC00..0xDFFF -> {
+                    bytes += 4
+                    i++
+                }
+                else -> bytes += 3
+            }
+            i++
+        }
+        return bytes
+    }
+
+    private fun ensureDir(): File? {
+        dir?.let { return it }
+        val app = appContext ?: return null
+        return synchronized(fileLock) {
+            dir ?: File(app.filesDir, DIR).apply { mkdirs() }.also { dir = it }
+        }
+    }
+
+    /** 调用时持有 [fileLock]。 */
+    private fun ensureWriterLocked() {
+        if (writerInitialized) return
+        writerInitialized = true
+        ensureDir()
+        openWriter()
+    }
+
     /** 调用时持有 [fileLock]。 */
     private fun openWriter() {
-        val d = dir ?: return
+        val d = ensureDir() ?: return
         val file = File(d, CURRENT)
         written = if (file.isFile) file.length() else 0L
         if (written >= MAX_FILE_BYTES) return rotate()
@@ -244,7 +324,7 @@ internal object LogRecorder {
 
     /** 调用时持有 [fileLock]。 */
     private fun rotate() {
-        val d = dir ?: return
+        val d = ensureDir() ?: return
         try {
             writer?.close()
         } catch (e: IOException) {
@@ -263,7 +343,7 @@ internal object LogRecorder {
 
     /** 系统崩溃缓冲里本应用的记录（普通应用只读得到自己的）存进 [CRASH]，有上限。 */
     private fun saveCrashBuffer() {
-        val d = dir ?: return
+        val d = ensureDir() ?: return
         val out = StringBuilder()
         try {
             val process = ProcessBuilder("logcat", "-d", "-b", "crash", "-v", "threadtime").redirectErrorStream(true).start()

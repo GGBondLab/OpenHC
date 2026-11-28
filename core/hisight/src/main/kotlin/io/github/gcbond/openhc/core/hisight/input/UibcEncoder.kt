@@ -38,10 +38,20 @@ internal class UibcEncoder(
     private val vendors: Set<String>,
     private val sourceDeviceType: Int?,
 ) {
-    private class Gesture(val width: Int, val height: Int, val points: List<HiSightInput.Point>)
-
     private val cipher = AesCtr(sessionKey)
-    private var gesture: Gesture? = null
+    private val canTouchDown = "left_point_down" in events
+    private val canTouchUp = "left_point_up" in events
+    private val canTouchMove = "left_move" in events
+    private val canKeyDown = "left_key_down" in events
+    private val canKeyUp = "left_key_up" in events
+    private val canText = TEXT_VENDOR in vendors
+    private var activeMask = 0
+    private var minId = -1
+    private var minX = 0
+    private var minY = 0
+    private var gestureWidth = 0
+    private var gestureHeight = 0
+    private val sortScratch = arrayOfNulls<HiSightInput.Point>(MAX_POINTS)
     private val pressedKeys = LinkedHashMap<Int, Long>()
 
     fun encode(input: HiSightInput): ByteArray = when (input) {
@@ -53,7 +63,14 @@ internal class UibcEncoder(
     /** 收尾：取最后一次快照里编号最小的触点，在原位置发 1 点的 UP（手机随之抬起整组），再按按下的逆序抬起所有键。 */
     fun release(): List<ByteArray> {
         val out = ArrayList<ByteArray>()
-        gesture?.let { out += touch(HiSightInput.Touch.Action.UP, it.points.subList(0, 1), it.width, it.height) }
+        if (activeMask != 0) {
+            out += touch(
+                HiSightInput.Touch.Action.UP,
+                listOf(HiSightInput.Point(minId, minX, minY)),
+                gestureWidth,
+                gestureHeight,
+            )
+        }
         for (code in pressedKeys.keys.toList().asReversed()) {
             out += key(HiSightInput.Key.Action.UP, code, pressedKeys.getValue(code))
         }
@@ -62,81 +79,114 @@ internal class UibcEncoder(
 
     /** 连接已断：丢掉按下状态，不再生成释放包。 */
     fun clear() {
-        gesture = null
+        activeMask = 0
+        minId = -1
         pressedKeys.clear()
     }
 
     private fun touch(action: HiSightInput.Touch.Action, points: List<HiSightInput.Point>, width: Int, height: Int): ByteArray {
-        val event = when (action) {
-            HiSightInput.Touch.Action.DOWN -> "left_point_down"
-            HiSightInput.Touch.Action.UP -> "left_point_up"
-            HiSightInput.Touch.Action.MOVE -> "left_move"
+        val allowed = when (action) {
+            HiSightInput.Touch.Action.DOWN -> canTouchDown
+            HiSightInput.Touch.Action.UP -> canTouchUp
+            HiSightInput.Touch.Action.MOVE -> canTouchMove
         }
-        require(event in events) { "触摸事件未经本次协商允许" }
+        require(allowed) { "触摸事件未经本次协商允许" }
         require(width in 1..65535 && height in 1..65535) { "视频宽高必须是 1..65535" }
-        require(points.size in 1..MAX_POINTS) { "触点数必须是 1..10" }
-        for (p in points) {
+        val n = points.size
+        require(n in 1..MAX_POINTS) { "触点数必须是 1..10" }
+        var mask = 0
+        var ordered = true
+        var prevId = -1
+        for (i in 0 until n) {
+            val p = points[i]
             require(p.id in 0..31 && p.x in 0 until width && p.y in 0 until height) { "触点编号或坐标超出范围" }
+            val bit = 1 shl p.id
+            require(mask and bit == 0) { "触点编号重复" }
+            mask = mask or bit
+            if (p.id < prevId) ordered = false
+            prevId = p.id
         }
-        val sorted = points.sortedBy { it.id }
-        val ids = sorted.map { it.id }
-        require(ids.toSet().size == ids.size) { "触点编号重复" }
-        val current = gesture
         when (action) {
-            HiSightInput.Touch.Action.DOWN -> check(current == null) { "还有按下的触点时不能再按下" }
-            HiSightInput.Touch.Action.MOVE -> check(current != null) { "移动前必须先按下" }
+            HiSightInput.Touch.Action.DOWN -> check(activeMask == 0) { "还有按下的触点时不能再按下" }
+            HiSightInput.Touch.Action.MOVE -> check(activeMask != 0) { "移动前必须先按下" }
             HiSightInput.Touch.Action.UP -> {
-                require(sorted.size == 1) { "抬起只能带一个触点" }
-                check(current != null && current.points.any { it.id == ids[0] }) { "抬起的触点不在当前按下的触点里" }
+                require(n == 1) { "抬起只能带一个触点" }
+                check(activeMask != 0 && (activeMask and mask) != 0) { "抬起的触点不在当前按下的触点里" }
             }
         }
 
-        val n = sorted.size
+        if (!ordered) {
+            for (i in 0 until n) sortScratch[i] = points[i]
+            for (i in 1 until n) {
+                val cur = sortScratch[i]!!
+                var j = i - 1
+                while (j >= 0 && sortScratch[j]!!.id > cur.id) {
+                    sortScratch[j + 1] = sortScratch[j]
+                    j--
+                }
+                sortScratch[j + 1] = cur
+            }
+        }
+
         val padding = (4 + 5 * n) % 2
-        val body = ByteArray(4 + 5 * n + padding)
-        body[0] = when (action) {
+        val bodySize = 4 + 5 * n + padding
+        val packet = allocateFrame(CATEGORY_GENERIC, bodySize)
+        val bodyBase = BODY_OFFSET
+        packet[bodyBase] = when (action) {
             HiSightInput.Touch.Action.DOWN -> 0
             HiSightInput.Touch.Action.UP -> 1
             HiSightInput.Touch.Action.MOVE -> 2
         }
-        putBe16(body, 1, 1 + 5 * n + padding)
-        body[3] = n.toByte()
-        var at = 4
-        for (p in sorted) {
-            body[at] = p.id.toByte()
-            putBe16(body, at + 1, p.x)
-            putBe16(body, at + 3, p.y)
+        putBe16(packet, bodyBase + 1, 1 + 5 * n + padding)
+        packet[bodyBase + 3] = n.toByte()
+        var at = bodyBase + 4
+        for (i in 0 until n) {
+            val p = if (ordered) points[i] else sortScratch[i]!!
+            if (i == 0 && action != HiSightInput.Touch.Action.UP) {
+                minId = p.id
+                minX = p.x
+                minY = p.y
+            }
+            packet[at] = p.id.toByte()
+            putBe16(packet, at + 1, p.x)
+            putBe16(packet, at + 3, p.y)
             at += 5
+            if (!ordered) sortScratch[i] = null
         }
-        val packet = wrap(CATEGORY_GENERIC, body)
-        gesture = if (action == HiSightInput.Touch.Action.UP) {
-            null
+        sealFrameInPlace(packet, bodySize)
+        if (action == HiSightInput.Touch.Action.UP) {
+            activeMask = 0
+            minId = -1
         } else {
-            Gesture(width, height, sorted.map { HiSightInput.Point(it.id, it.x, it.y) })
+            activeMask = mask
+            gestureWidth = width
+            gestureHeight = height
         }
         return packet
     }
 
     private fun key(action: HiSightInput.Key.Action, code: Int, meta: Long): ByteArray {
-        val event = if (action == HiSightInput.Key.Action.DOWN) "left_key_down" else "left_key_up"
-        require(event in events) { "按键未经本次协商允许" }
+        val allowed = if (action == HiSightInput.Key.Action.DOWN) canKeyDown else canKeyUp
+        require(allowed) { "按键未经本次协商允许" }
         require(code in 0..0xFFFF && meta in 0..0xFFFF_FFFFL) { "键码或修饰位超出范围" }
         require(sourceDeviceType == SOURCE_ANDROID_KEYS || (code in BASIC_KEY_CODES && meta == 0L)) {
             "手机没选源设备类型 7，只能发基础键、修饰位为 0"
         }
         if (action == HiSightInput.Key.Action.UP) check(code in pressedKeys) { "按键抬起前必须已经按下" }
-        val body = ByteArray(12)
-        body[0] = if (action == HiSightInput.Key.Action.DOWN) 3 else 4
-        putBe16(body, 1, 9)
-        putBe16(body, 4, code)
-        for (i in 0 until 4) body[8 + i] = (meta ushr (24 - 8 * i)).toByte()
-        val packet = wrap(CATEGORY_GENERIC, body)
+        val bodySize = 12
+        val packet = allocateFrame(CATEGORY_GENERIC, bodySize)
+        val bodyBase = BODY_OFFSET
+        packet[bodyBase] = if (action == HiSightInput.Key.Action.DOWN) 3 else 4
+        putBe16(packet, bodyBase + 1, 9)
+        putBe16(packet, bodyBase + 4, code)
+        for (i in 0 until 4) packet[bodyBase + 8 + i] = (meta ushr (24 - 8 * i)).toByte()
+        sealFrameInPlace(packet, bodySize)
         if (action == HiSightInput.Key.Action.DOWN) pressedKeys[code] = meta else pressedKeys.remove(code)
         return packet
     }
 
     private fun text(text: String): ByteArray {
-        require(TEXT_VENDOR in vendors) { "成文输入未经本次协商允许" }
+        require(canText) { "成文输入未经本次协商允许" }
         require('\u0000' !in text) { "成文输入不能含 NUL" }
         val raw = try {
             val encoder = Charsets.UTF_8.newEncoder()
@@ -149,23 +199,27 @@ internal class UibcEncoder(
         }
         require(raw.size in 1..MAX_TEXT_BYTES) { "成文输入的 UTF-8 字节数必须是 1..472" }
         val padding = (5 + raw.size) % 2
-        val body = ByteArray(5 + raw.size + padding)
-        putBe16(body, 1, 2 + raw.size + padding)
-        putBe16(body, 3, raw.size)
-        System.arraycopy(raw, 0, body, 5, raw.size)
-        return wrap(CATEGORY_VENDOR, body)
+        val bodySize = 5 + raw.size + padding
+        val packet = allocateFrame(CATEGORY_VENDOR, bodySize)
+        val bodyBase = BODY_OFFSET
+        putBe16(packet, bodyBase + 1, 2 + raw.size + padding)
+        putBe16(packet, bodyBase + 3, raw.size)
+        System.arraycopy(raw, 0, packet, bodyBase + 5, raw.size)
+        sealFrameInPlace(packet, bodySize)
+        return packet
     }
 
-    private fun wrap(category: Int, body: ByteArray): ByteArray {
-        val plain = ByteArray(6 + body.size)
-        for (i in 0 until 6) plain[i] = 0xFF.toByte()
-        System.arraycopy(body, 0, plain, 6, body.size)
-        val sealed = cipher.seal(plain, random)
-        val packet = ByteArray(4 + sealed.size)
+    /** 一次性分配完整帧空间 `4 头 + 16 IV + 6 0xFF + bodySize`，填好外层头和 6 个 0xFF。 */
+    private fun allocateFrame(category: Int, bodySize: Int): ByteArray {
+        val packet = ByteArray(BODY_OFFSET + bodySize)
         packet[1] = category.toByte()
         putBe16(packet, 2, packet.size)
-        System.arraycopy(sealed, 0, packet, 4, sealed.size)
+        for (i in 0 until 6) packet[PLAIN_OFFSET + i] = 0xFF.toByte()
         return packet
+    }
+
+    private fun sealFrameInPlace(packet: ByteArray, bodySize: Int) {
+        cipher.sealInto(random, packet, PLAIN_OFFSET, 6 + bodySize, packet, 4)
     }
 
     private fun putBe16(b: ByteArray, at: Int, value: Int) {
@@ -187,6 +241,8 @@ internal class UibcEncoder(
 
         private const val CATEGORY_GENERIC = 0
         private const val CATEGORY_VENDOR = 2
+        private const val PLAIN_OFFSET = 20
+        private const val BODY_OFFSET = 26
         private const val MAX_POINTS = 10
         private const val MAX_TEXT_BYTES = 472
     }

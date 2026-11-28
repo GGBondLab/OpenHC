@@ -23,6 +23,13 @@ internal class AesCtr(sessionKey: ByteArray) {
     /** 加密一个单元，返回 `IV16 || 密文`。IV 每次从 [random] 取。 */
     fun seal(plain: ByteArray, random: SecureRandom): ByteArray = cipher.seal(random, plain)
 
+    /** 原地或指定偏移加密成 `IV16 || 密文` 写入 `dest[destOffset..]`。 */
+    fun sealInto(
+        random: SecureRandom,
+        plain: ByteArray, plainOffset: Int, length: Int,
+        dest: ByteArray, destOffset: Int,
+    ) = cipher.sealInto(random, plain, plainOffset, length, dest, destOffset)
+
     /** 解密 `IV16 || 密文`；不足 16 字节说明缺 IV，按对端数据非法处理。 */
     fun open(unit: ByteArray, offset: Int = 0, length: Int = unit.size - offset): ByteArray {
         if (length < IV_BYTES) throw MalformedMessageException("加密单元不足 16 字节，缺少 IV")

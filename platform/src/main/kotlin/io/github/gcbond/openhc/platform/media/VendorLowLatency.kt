@@ -29,6 +29,14 @@ internal object VendorLowLatency {
                 listOf("vendor.rtc-ext-dec-low-latency.enable" to 1)
             name.startsWith("omx.amlogic.") || name.startsWith("c2.amlogic.") ->
                 listOf("vendor.low-latency.enable" to 1)
+            name.startsWith("omx.mtk.") || name.startsWith("c2.mtk.") -> listOf(
+                "vendor.mtk.ext.dec.low-latency.enable" to 1,
+                "vdec-lowlatency" to 1,
+            )
+            name.startsWith("omx.sprd.") || name.startsWith("c2.unisoc.") || name.startsWith("c2.sprd.") ->
+                listOf("vendor.sprd-low-latency.enable" to 1)
+            name.startsWith("omx.rk.") || name.startsWith("c2.rk.") ->
+                listOf("vendor.rk-low-latency.enable" to 1)
             else -> emptyList()
         }
     }

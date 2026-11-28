@@ -33,7 +33,8 @@ internal object MicPermission {
  */
 internal class MicInput(context: Context, private val attemptId: Int) : MicStreamListener, Closeable {
     private val app: Context = context.applicationContext ?: context
-    private val worker: ExecutorService = Executors.newSingleThreadExecutor { r -> Thread(r, "OpenHC-Mic-$attemptId") }
+    private val workerLock = Any()
+    private var worker: ExecutorService? = null
 
     /** 投递函数：把一块声音交到协议线程上送出，送完调第二个参数。 */
     @Volatile
@@ -59,25 +60,46 @@ internal class MicInput(context: Context, private val attemptId: Int) : MicStrea
     override fun onMicEvent(event: MicEvent) {
         Log.i(TAG, "[$attemptId] $event")
         when (event) {
-            is MicEvent.Started -> post { start(event.parameters) }
-            is MicEvent.ParametersChanged -> post { if (capture != null) start(event.parameters) }
-            is MicEvent.Stopped -> post { stop("麦克风会话结束（${event.reason.label}）") }
+            is MicEvent.Started -> post(createIfNeeded = true) { start(event.parameters) }
+            is MicEvent.ParametersChanged -> post(createIfNeeded = false) { if (capture != null) start(event.parameters) }
+            is MicEvent.Stopped -> post(createIfNeeded = false) { stop("麦克风会话结束（${event.reason.label}）") }
             else -> Unit
         }
     }
 
-    /** 连接结束：停采集、关线程。只在调度线程上调用（执行器已经停了，不会再有回调）。 */
+    /** 连接结束：停采集、关线程。只在调度线程上调用（执行器已经停了，不会再有回调）。没开过麦克风时不建线程。 */
     override fun close() {
-        if (closed) return
-        closed = true
-        post { stop("连接结束") }
-        worker.shutdown()
-        if (!worker.awaitTermination(CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)) Log.w(TAG, "[$attemptId] 麦克风线程没有按时退出")
+        val existing = synchronized(workerLock) {
+            if (closed) return
+            closed = true
+            worker
+        } ?: return
+        try {
+            existing.execute {
+                try {
+                    stop("连接结束")
+                } catch (e: RuntimeException) {
+                    Log.w(TAG, "[$attemptId] 麦克风处理出错：${e.javaClass.simpleName}：${e.message}")
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // 已经关了。
+        }
+        existing.shutdown()
+        if (!existing.awaitTermination(CLOSE_WAIT_MILLIS, TimeUnit.MILLISECONDS)) Log.w(TAG, "[$attemptId] 麦克风线程没有按时退出")
     }
 
-    private fun post(task: () -> Unit) {
+    private fun post(createIfNeeded: Boolean, task: () -> Unit) {
+        val target = synchronized(workerLock) {
+            if (closed) return
+            worker ?: if (!createIfNeeded) {
+                return
+            } else {
+                Executors.newSingleThreadExecutor { r -> Thread(r, "OpenHC-Mic-$attemptId") }.also { worker = it }
+            }
+        }
         try {
-            worker.execute {
+            target.execute {
                 try {
                     task()
                 } catch (e: RuntimeException) {

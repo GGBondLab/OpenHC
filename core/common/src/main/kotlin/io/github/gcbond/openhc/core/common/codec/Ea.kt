@@ -44,13 +44,21 @@ object Ea {
     /** 编码成最短形式。超出 0..[MAX_VALUE] 抛 [IllegalArgumentException]。 */
     fun encode(value: Int): ByteArray {
         val out = ByteArray(encodedSize(value))
+        encodeInto(value, out, 0)
+        return out
+    }
+
+    /** 将 [value] 最短形式直接写入 `out[offset..]`，返回写入字节数（1..4）。 */
+    fun encodeInto(value: Int, out: ByteArray, offset: Int): Int {
+        val len = encodedSize(value)
+        require(offset >= 0 && offset <= out.size - len) { "范围非法: offset=$offset len=$len size=${out.size}" }
         var rest = value
-        for (i in out.indices) {
+        for (i in 0 until len) {
             val group = rest and 0x7F
             rest = rest ushr 7
-            out[i] = (if (i == out.size - 1) group or 0x80 else group).toByte()
+            out[offset + i] = (if (i == len - 1) group or 0x80 else group).toByte()
         }
-        return out
+        return len
     }
 
     /**

@@ -108,6 +108,7 @@
 
     <!-- 设置 -->
     <string name="settings_title">设置</string>
+    <string name="theme_auto">自动</string>
     <string name="theme_light">浅色</string>
     <string name="theme_dark">深色</string>
     <string name="settings_apply_hint">大部分改动下次连接时生效</string>
@@ -128,6 +129,8 @@
     <string name="settings_bt_current_unavailable">当前：没有取到，按 02:00:00:00:00:00 处理（有线照样能连）</string>
     <string name="settings_bt_manual_label">手动填写（格式 AA:BB:CC:DD:EE:FF）</string>
     <string name="settings_bt_invalid">格式不对，或者是占位地址</string>
+    <string name="settings_bt_saved">已保存手动蓝牙地址：%1$s</string>
+    <string name="settings_bt_cleared">已清除手动蓝牙地址</string>
     <string name="settings_bt_hint">一般不用填。无线连接优先用车机系统里读到的地址，读不到才用这里填的；有线连接填了就用填的。地址变了，手机会把车机当成另一台车，要重新输连接码配对。</string>
 
     <!-- 通知 -->

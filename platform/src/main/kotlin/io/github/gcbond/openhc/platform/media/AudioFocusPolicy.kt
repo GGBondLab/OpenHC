@@ -136,11 +136,13 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
         var selfLosses = 0
         var selfPauses = 0
         var selfDucks = 0
+        var selfChangedAt = 0L
 
         fun clearSelf() {
             selfLosses = 0
             selfPauses = 0
             selfDucks = 0
+            selfChangedAt = 0L
         }
         var sounding = 0
         var phoneWants = false
@@ -184,10 +186,11 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
         return out
     }
 
-    /** 手机放弃这个用途的焦点（它放完了）。 */
-    fun phoneAbandoned(usage: AudioUsage, nowMillis: Long): List<Command> {
+    /** 手机放弃这个用途的焦点（它放完了）。[transientOnly] 为 true 时只在拿着短暂焦点时才放，不打断长期音乐焦点。 */
+    fun phoneAbandoned(usage: AudioUsage, nowMillis: Long, transientOnly: Boolean = false): List<Command> {
         phoneEverSent = true
         val slot = slot(usage)
+        if (transientOnly && slot.gain == Gain.GAIN) return emptyList()
         slot.phoneWants = false
         slot.phoneAbandonedAt = nowMillis
         val out = ArrayList<Command>(2)
@@ -253,7 +256,7 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
                 slot.state = State.LOST
                 setLevel(slot, Level.MUTED, out)
                 if (usage == AudioUsage.MEDIA) tellPhone(PhoneChange.LOST_TRANSIENT, out)
-                expectSelfChanges(slot, slot.gain, -1)
+                expectSelfChanges(slot, slot.gain, -1, nowMillis)
             }
         }
         update(nowMillis, out)
@@ -264,7 +267,7 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
     fun focusChanged(usage: AudioUsage, change: Change, nowMillis: Long): List<Command> {
         val slot = slot(usage)
         val out = ArrayList<Command>(3)
-        if (!slot.state.active || consumeSelfChange(slot, change)) return out
+        if (!slot.state.active || consumeSelfChange(slot, change, nowMillis)) return out
         val media = usage == AudioUsage.MEDIA
         when (change) {
             Change.GAIN -> {
@@ -377,7 +380,7 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
     private fun slot(usage: AudioUsage): Slot = slots.getValue(usage)
 
     private fun request(slot: Slot, gain: Gain, nowMillis: Long, out: MutableList<Command>) {
-        expectSelfChanges(slot, gain, +1)
+        expectSelfChanges(slot, gain, +1, nowMillis)
         slot.state = State.HELD
         slot.gain = gain
         slot.requestedAt = nowMillis
@@ -427,24 +430,32 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
      * 我们申请 [requester] 的焦点（[delta] 为 +1），或这次申请被拒绝（-1、撤掉）：正拿着焦点的另几路会各收到一次变化，
      * 按申请的类型记下（长期 → 长期失去，短暂 → 暂时失去，短暂并压低别人 → 暂时可压低）。
      */
-    private fun expectSelfChanges(requester: Slot, gain: Gain?, delta: Int) {
+    private fun expectSelfChanges(requester: Slot, gain: Gain?, delta: Int, nowMillis: Long) {
         for (other in slots.values) {
             if (other === requester || other.state != State.HELD) continue
+            if (delta > 0 && nowMillis - other.selfChangedAt > SELF_CHANGE_EXPIRY_MILLIS) other.clearSelf()
             when (gain) {
                 Gain.GAIN -> other.selfLosses = (other.selfLosses + delta).coerceAtLeast(0)
                 Gain.TRANSIENT, Gain.TRANSIENT_EXCLUSIVE -> other.selfPauses = (other.selfPauses + delta).coerceAtLeast(0)
                 Gain.TRANSIENT_MAY_DUCK -> other.selfDucks = (other.selfDucks + delta).coerceAtLeast(0)
                 null -> Unit
             }
+            if (delta > 0) other.selfChangedAt = nowMillis
         }
     }
 
-    /** 这次变化是我们自己的申请引起的：记的次数减一、返回 true（不理会）。 */
-    private fun consumeSelfChange(slot: Slot, change: Change): Boolean = when (change) {
-        Change.LOSS -> slot.selfLosses > 0 && slot.selfLosses-- > 0
-        Change.LOSS_TRANSIENT -> slot.selfPauses > 0 && slot.selfPauses-- > 0
-        Change.LOSS_TRANSIENT_CAN_DUCK -> slot.selfDucks > 0 && slot.selfDucks-- > 0
-        Change.GAIN -> false
+    /** 这次变化是我们自己的申请引起的：记的次数减一、返回 true（不理会）。超过 [SELF_CHANGE_EXPIRY_MILLIS] 的陈旧计数作废。 */
+    private fun consumeSelfChange(slot: Slot, change: Change, nowMillis: Long): Boolean {
+        if (nowMillis - slot.selfChangedAt > SELF_CHANGE_EXPIRY_MILLIS) {
+            slot.clearSelf()
+            return false
+        }
+        return when (change) {
+            Change.LOSS -> slot.selfLosses > 0 && slot.selfLosses-- > 0
+            Change.LOSS_TRANSIENT -> slot.selfPauses > 0 && slot.selfPauses-- > 0
+            Change.LOSS_TRANSIENT_CAN_DUCK -> slot.selfDucks > 0 && slot.selfDucks-- > 0
+            Change.GAIN -> false
+        }
     }
 
     private fun setLevel(slot: Slot, level: Level, out: MutableList<Command>) {
@@ -500,6 +511,9 @@ class AudioFocusPolicy(private val systemDucks: Boolean) {
 
         /** 手机报语音助手在用之后，最长这么久没报空闲就当空闲（免得一条消息丢了媒体一直压着）。 */
         const val ASSISTANT_STATE_MAX_MILLIS = 30_000L
+
+        /** 自己申请焦点预期引发其他路收到系统回调的有效窗口；超过说明系统没发（如安卓 8.0+ 自动压低），不再吞外部回调。 */
+        const val SELF_CHANGE_EXPIRY_MILLIS = 1_000L
 
         fun gainOf(usage: AudioUsage): Gain = when (usage) {
             AudioUsage.MEDIA -> Gain.GAIN

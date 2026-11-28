@@ -1,8 +1,8 @@
 package io.github.gcbond.openhc.wifi
 
 import android.content.Context
-import android.util.Log
 import androidx.core.content.edit
+import io.github.gcbond.openhc.platform.log.Log
 
 /** 「连接时暂停车机 WiFi 扫描」的开关和待恢复记号（单独一个 SharedPreferences 文件）。 */
 class ScanPausePreferences(context: Context) : PendingJournal {
