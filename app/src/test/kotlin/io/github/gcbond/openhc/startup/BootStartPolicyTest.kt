@@ -37,9 +37,26 @@ class BootStartPolicyTest {
     }
 
     @Test
+    fun preferredConnectionOverridesTheDefaultCableWait() {
+        // 选「优先无线」：开机直接走无线，不先停在等插线（哪怕按自动规则会等）。
+        assertFalse(wait(plugged = false, usbAuto = true, wireless = true, preferred = BootStartPolicy.PREFERRED_WIRELESS))
+        assertFalse(wait(plugged = false, usbAuto = false, wireless = true, preferred = BootStartPolicy.PREFERRED_WIRELESS))
+        assertFalse(wait(plugged = false, usbAuto = true, wireless = false, preferred = BootStartPolicy.PREFERRED_WIRELESS),
+            "选了无线就不为有线等待，哪怕现在没开自动连接手机")
+        // 选「优先有线」：总是先等插线。
+        assertTrue(wait(plugged = false, usbAuto = true, wireless = true, preferred = BootStartPolicy.PREFERRED_WIRED))
+        assertTrue(wait(plugged = false, usbAuto = false, wireless = true, preferred = BootStartPolicy.PREFERRED_WIRED))
+    }
+    
+    @Test
     fun bootWaitsForTheCableUnlessPluggingStartsWiredByItself() {
-        fun wait(plugged: Boolean, usbAuto: Boolean, wireless: Boolean) =
-            BootStartPolicy.waitForCable(phonePlugged = plugged, usbAutoConnect = usbAuto, wirelessWanted = wireless)
+        fun wait(plugged: Boolean, usbAuto: Boolean, wireless: Boolean, preferred: Int = BootStartPolicy.PREFERRED_AUTO) =
+            BootStartPolicy.waitForCable(
+                phonePlugged = plugged,
+                usbAutoConnect = usbAuto,
+                wirelessWanted = wireless,
+                preferred = preferred,
+            )
         assertTrue(wait(plugged = true, usbAuto = true, wireless = true), "插着手机：等插线")
         assertTrue(wait(plugged = false, usbAuto = true, wireless = false), "不做无线：等插线")
         assertFalse(wait(plugged = false, usbAuto = true, wireless = true), "插线时系统会拉起本应用：不用等")

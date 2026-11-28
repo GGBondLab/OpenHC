@@ -41,4 +41,6 @@
     <string name="settings_boot_silent_wireless_both">开机后不打开首页，在后台待命：用无线连过的手机蓝牙连上车机时，打开 OpenHC 自动连接；插上手机（或开机时已经插着）就改走有线。</string>
     <string name="settings_boot_silent_wireless_blocked">开机后不打开首页，在后台等插线；用无线连过的手机蓝牙连上车机时，打开 OpenHC 改走无线自动连接。</string>
     <string name="settings_boot_overlay_missing_silent">还差悬浮窗权限：没有它，手机连上时投屏画面出不来。点这里去开；找不到的话，在车机系统设置的「应用」里找到 OpenHC，打开「悬浮窗」或「显示在其他应用上层」。</string>
+    <string name="settings_boot_wireless_only">开机打开 OpenHC 后直接用无线连上次用无线连过的手机（手机蓝牙要连着车机），不先等插线。</string>
+    <string name="settings_boot_silent_wireless_only">开机后不打开首页，在后台直接用无线连上次用无线连过的手机（手机蓝牙要连着车机），不先等插线。</string>
 </resources>

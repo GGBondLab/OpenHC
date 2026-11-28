@@ -38,6 +38,8 @@ internal class WirelessSettingsState(context: Context) {
 
     var wiredOnly by mutableStateOf(prefs.wiredOnly)
         private set
+    var preferredConnection by mutableStateOf(prefs.preferredConnection)
+        private set
     var connectOnBluetooth by mutableStateOf(prefs.connectOnBluetooth)
         private set
     var wifiDirect by mutableStateOf(prefs.wifiDirect)
@@ -55,6 +57,12 @@ internal class WirelessSettingsState(context: Context) {
         wiredOnly = value
         prefs.wiredOnly = value
         controller?.onWiredOnlyChanged()
+    }
+
+    /** 连接方式：0 自动、1 优先有线、2 优先无线（见 WirelessPreferences）。 */
+    fun changePreferredConnection(value: Int) {
+        preferredConnection = value
+        prefs.preferredConnection = value
     }
 
     /** 无线方式：0 车机开热点、1 直连、2 车机自带热点。下一次无线连接生效，正在进行的连接照旧。 */
@@ -92,6 +100,25 @@ internal class WirelessSettingsState(context: Context) {
 internal fun rememberWirelessSettingsState(): WirelessSettingsState {
     val context = LocalContext.current
     return remember(context) { WirelessSettingsState(context) }
+}
+
+/**
+ * 连接方式（默认「自动」，保持原行为）：选「优先无线」时，开机后直接走无线自动连接，不先进入等插线，
+ * 省掉「先在有线停一会儿再切无线」的等待；选「优先有线」时开机先等插线。「自动」按原来的规则。
+ */
+@Composable
+internal fun PreferredConnectionSetting(state: WirelessSettingsState) {
+    ChoiceRow(
+        title = stringResource(R.string.settings_preferred_connection),
+        summary = stringResource(R.string.settings_preferred_connection_summary),
+        options = listOf(
+            stringResource(R.string.settings_preferred_connection_auto),
+            stringResource(R.string.settings_preferred_connection_wired),
+            stringResource(R.string.settings_preferred_connection_wireless),
+        ),
+        selected = state.preferredConnection,
+        description = stringResource(R.string.settings_preferred_connection_hint),
+    ) { state.changePreferredConnection(it) }
 }
 
 /** 只用数据线连接（默认关）：开着时无线关掉，提示自动连接手机不起作用。 */

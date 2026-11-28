@@ -21,6 +21,22 @@ class WirelessPreferences(context: Context) {
         set(value) = prefs.edit { putBoolean(KEY_WIRED_ONLY, value) }
 
     /**
+     * 开机 / 自动连接时优先用哪种连接方式（默认 [CONNECTION_AUTO]，保持原行为）。
+     *
+     * - [CONNECTION_WIRED]：先等插线，插上就走有线（即使已经用无线连过、手机蓝牙也连着）；
+     * - [CONNECTION_WIRELESS]：不等待插线，直接用无线连手机。开机时省掉「先在有线停一会儿再切无线」的等待；
+     * - [CONNECTION_AUTO]：按原来的规则，插线能自己拉起应用时先让无线。
+     *
+     * 只影响自动连接时先走哪条路；手动点「开始连接」、真插上线时两条路照旧可用。改完下次自动连接生效。
+     */
+    var preferredConnection: Int
+        get() = prefs.getInt(KEY_PREFERRED_CONNECTION, CONNECTION_AUTO).coerceIn(
+            CONNECTION_AUTO,
+            CONNECTION_WIRELESS,
+        )
+        set(value) = prefs.edit { putInt(KEY_PREFERRED_CONNECTION, value.coerceIn(CONNECTION_AUTO, CONNECTION_WIRELESS)) }
+
+    /**
      * 自动连接手机（默认开；存储的键沿用旧名「蓝牙连上自动连接」）：手机和车机的经典蓝牙一连上（打电话、听歌用的那种连接），
      * 或者打开本应用时（含开机自动打开），车机主动去拨用无线连成功过的手机（[knownPhones]）。本应用没在运行时由系统拉起来。
      */
@@ -128,6 +144,7 @@ class WirelessPreferences(context: Context) {
 
         private const val FILE = "openhc-wireless"
         private const val KEY_WIRED_ONLY = "wired_only"
+        private const val KEY_PREFERRED_CONNECTION = "preferred_connection"
         private const val KEY_WIFI_DIRECT = "wifi_direct"
         private const val KEY_CAR_HOTSPOT = "car_hotspot"
         private const val KEY_CAR_HOTSPOT_NAME = "car_hotspot_name"
@@ -139,7 +156,9 @@ class WirelessPreferences(context: Context) {
 
         /** 「连成功过的手机」最多记几台。 */
         const val MAX_KNOWN_PHONES = 5
-
+        const val CONNECTION_AUTO = 0
+        const val CONNECTION_WIRED = 1
+        const val CONNECTION_WIRELESS = 2
         /**
          * 系统支持「WiFi 直连」这种无线方式：要按指定频率建组。安卓 10 起有公开接口；安卓 6～9 靠系统内部的设信道接口，
          * 有的车机不认，建组时会明说（见 WifiDirectGroupOwner）。所以 OpenHC 支持的系统（安卓 6 起）都算支持。

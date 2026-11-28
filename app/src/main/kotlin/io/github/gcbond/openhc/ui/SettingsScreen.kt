@@ -172,6 +172,7 @@ private fun CategoryContent(
     when (category) {
         SettingsCategory.PICTURE -> PictureSettingsSection(settings, screen)
         SettingsCategory.CONNECTION -> SettingsGroup(stringResource(R.string.settings_group_connection)) {
+            PreferredConnectionSetting(wireless)
             WiredOnlySetting(wireless)
             WirelessModeSetting(wireless)
             BluetoothAddressSection(settings, systemBluetoothAddress)
