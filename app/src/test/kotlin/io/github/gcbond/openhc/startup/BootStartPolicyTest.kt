@@ -48,15 +48,15 @@ class BootStartPolicyTest {
         assertTrue(wait(plugged = false, usbAuto = false, wireless = true, preferred = BootStartPolicy.PREFERRED_WIRED))
     }
     
+    private fun wait(plugged: Boolean, usbAuto: Boolean, wireless: Boolean, preferred: Int = BootStartPolicy.PREFERRED_AUTO) =
+        BootStartPolicy.waitForCable(
+            phonePlugged = plugged,
+            usbAutoConnect = usbAuto,
+            wirelessWanted = wireless,
+            preferred = preferred,
+    )
     @Test
     fun bootWaitsForTheCableUnlessPluggingStartsWiredByItself() {
-        fun wait(plugged: Boolean, usbAuto: Boolean, wireless: Boolean, preferred: Int = BootStartPolicy.PREFERRED_AUTO) =
-            BootStartPolicy.waitForCable(
-                phonePlugged = plugged,
-                usbAutoConnect = usbAuto,
-                wirelessWanted = wireless,
-                preferred = preferred,
-            )
         assertTrue(wait(plugged = true, usbAuto = true, wireless = true), "插着手机：等插线")
         assertTrue(wait(plugged = false, usbAuto = true, wireless = false), "不做无线：等插线")
         assertFalse(wait(plugged = false, usbAuto = true, wireless = true), "插线时系统会拉起本应用：不用等")
