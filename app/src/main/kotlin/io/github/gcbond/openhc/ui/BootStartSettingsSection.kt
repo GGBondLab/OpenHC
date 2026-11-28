@@ -51,6 +51,7 @@ internal fun BootStartSettingsSection(autoConnect: Boolean = false, extraRows: @
     val installedAt = remember(context) { BootStart.installedAtMillis(context) }
     // 自动连接手机在同一页里能切换：跟着 [autoConnect] 重算。
     val wirelessWanted = remember(context, autoConnect) { BootStart.wirelessWanted(context) }
+    val preferredConnection = remember(context) { WirelessPreferences(context).preferredConnection }
     val usbChanges by UsbAutoConnect.changes.collectAsState()
     val usbAutoConnect = remember(context, usbChanges) { UsbAutoConnect.isEnabled(context) }
     // 从系统设置页回来时重查悬浮窗权限。
@@ -80,6 +81,8 @@ internal fun BootStartSettingsSection(autoConnect: Boolean = false, extraRows: @
     val afterBoot = when {
         silent && (!wirelessWanted || !hotspotSupported) -> R.string.settings_boot_silent_wired
         !wirelessWanted -> R.string.settings_boot_wired
+        preferredConnection == WirelessPreferences.CONNECTION_WIRED -> if (silent) R.string.settings_boot_silent_wired else R.string.settings_boot_wired
+        preferredConnection == WirelessPreferences.CONNECTION_WIRELESS -> if (silent) R.string.settings_boot_silent_wireless_only else R.string.settings_boot_wireless_only
         usbAutoConnect -> if (silent) R.string.settings_boot_silent_wireless_both else R.string.settings_boot_wireless_both
         else -> if (silent) R.string.settings_boot_silent_wireless_blocked else R.string.settings_boot_wireless_blocked
     }
@@ -89,6 +92,7 @@ internal fun BootStartSettingsSection(autoConnect: Boolean = false, extraRows: @
             phonePlugged = false,
             usbAutoConnect = usbAutoConnect,
             wirelessWanted = wirelessWanted,
+            preferred = preferredConnection,
         )
     val silentNote = when {
         !enabled -> stringResource(R.string.settings_boot_silent_needs_boot)

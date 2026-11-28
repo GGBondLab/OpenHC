@@ -48,4 +48,11 @@
     <string name="settings_wireless_random_hint">只在确认车机广播的发送地址不是车机蓝牙地址时试（用别的手机装 BLE 扫描工具对比）；手机看到这个声明以后怎么找车机，没有验证过。</string>
     <string name="settings_wireless_gatt">同时挂 GATT 服务（默认开）</string>
     <string name="settings_wireless_gatt_hint">实测的手机回连时不连它；另一类手机系统可能会连上来取车机地址。日志 OpenHC-Wireless 会记下有没有手机来连、写了多少字节。</string>
+    <!-- 连接方式（开机 / 自动连接优先走哪条路） -->
+    <string name="settings_preferred_connection">连接方式</string>
+    <string name="settings_preferred_connection_summary">开机自动连接时优先用有线还是无线</string>
+    <string name="settings_preferred_connection_auto">自动</string>
+    <string name="settings_preferred_connection_wired">优先有线</string>
+    <string name="settings_preferred_connection_wireless">优先无线</string>
+    <string name="settings_preferred_connection_hint">选「优先无线」时，开机后直接连无线，不再先停在有线等待；选「优先有线」时开机先等插线。「自动」保持原来的行为。只影响自动连接，手动点「开始连接」和插线照旧可用。</string>
 </resources>

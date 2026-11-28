@@ -99,6 +99,7 @@ internal object BootStart {
         phonePlugged = phonePlugged(context),
         usbAutoConnect = UsbAutoConnect.isEnabled(context),
         wirelessWanted = wirelessWanted(context),
+        preferred = WirelessPreferences(context).preferredConnection,
     )
 
     /** 开机后无线要不要自动连手机（只看设置）。 */

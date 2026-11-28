@@ -48,15 +48,24 @@ object BootStartPolicy {
     /**
      * 开机打开界面以后，要不要像点了「开始」一样进入等插线。
      *
-     * 无线平时不占着什么（「自动连接手机」只在手机蓝牙连上、或界面回到前台时拨一次），有线在等插线时，
-     * 用无线连成功过的手机蓝牙一连上，无线就请有线停下、改走无线；所以等不等插线只看有线自己：
+     * [preferred] 是设置里选的「连接方式」：选「有线」时总进入等插线；选「无线」时总不进入
+     * （不为了等插线浪费时间，开机后直接让「自动连接手机」去连无线）；选「自动」时按原来规则：
      * - 车机上已经插着手机：进入等插线（插着的手机不会再有一次「设备接入」把有线带起来）；
      * - 不做无线（[wirelessWanted] 为假）：进入等插线；
      * - 开着「插线时不再弹窗」：不进入，插线时系统会拉起本应用，照样开始有线；
      * - 没开：插线不会自己开始有线，进入等插线。
      */
-    fun waitForCable(phonePlugged: Boolean, usbAutoConnect: Boolean, wirelessWanted: Boolean): Boolean =
-        phonePlugged || !wirelessWanted || !usbAutoConnect
+    fun waitForCable(phonePlugged: Boolean, usbAutoConnect: Boolean, wirelessWanted: Boolean, preferred: Int,): Boolean =
+         when (preferred) {
+            PREFERRED_WIRED -> true
+            PREFERRED_WIRELESS -> false
+            else -> phonePlugged || !wirelessWanted || !usbAutoConnect
+    }
+
+    /** 连接方式选项，与 [io.github.gcbond.openhc.settings.WirelessPreferences] 中同名值一致（不依赖安卓类）。 */
+    const val PREFERRED_AUTO = 0
+    const val PREFERRED_WIRED = 1
+    const val PREFERRED_WIRELESS = 2
 
     /** 开机后无线要不要自动连手机，只看设置：没开「只用数据线连接」，并且开着「自动连接手机」。 */
     fun wirelessWanted(wiredOnly: Boolean, connectOnBluetooth: Boolean): Boolean = !wiredOnly && connectOnBluetooth
